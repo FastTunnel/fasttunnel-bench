@@ -1,0 +1,192 @@
+﻿# 对照压测：http 模式与 tcp 模式各一版，双方代理方式一致；每档先预热再测
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      ft_release:
+        description: 'FastTunnel Release tag（用官方发布包测试）'
+        default: 'v3.4.0'
+      mode:
+        description: '跑哪些模式（http / tcp / both）'
+        default: 'both'
+      levels:
+        description: 'RPS 阶梯'
+        default: '5000,10000,20000,30000,40000,50000'
+      connections:
+        description: '并发连接数'
+        default: '128'
+      duration:
+        description: '每档测量秒数'
+        default: '10'
+      prewarm:
+        description: '每侧预热秒数'
+        default: '10'
+  push:
+    paths:
+      - '.github/workflows/bench.yml'
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout benchmark repo
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: 安装绘图依赖与中文字体
+        run: |
+          python3 -m pip install --quiet pillow
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk >/dev/null
+          fc-list | grep -i noto | head -n 3
+
+      - name: 环境与脚本检查
+        run: |
+          echo "cores=$(nproc)  mem=$(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo) GB  $(uname -srm)"
+          dotnet --version
+          bash -n bench/exp/bench.sh && echo "bench.sh 语法通过"
+
+      - name: HTTP 对照（FastTunnel Web vs frp type=http）
+        if: ${{ github.event.inputs.mode != 'tcp' }}
+        run: |
+          bash bench/exp/bench.sh http \
+            --levels "${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}" \
+            --connections "${{ github.event.inputs.connections || '128' }}" \
+            --duration "${{ github.event.inputs.duration || '10' }}" \
+            --prewarm "${{ github.event.inputs.prewarm || '10' }}" \
+            --ft-release "${{ github.event.inputs.ft_release || 'v3.4.0' }}"
+
+      - name: TCP 对照（FastTunnel Forwards vs frp type=tcp）
+        if: ${{ github.event.inputs.mode != 'http' }}
+        continue-on-error: true
+        run: |
+          bash bench/exp/bench.sh tcp \
+            --levels "${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}" \
+            --connections "${{ github.event.inputs.connections || '128' }}" \
+            --duration "${{ github.event.inputs.duration || '10' }}" \
+            --prewarm "${{ github.event.inputs.prewarm || '10' }}" \
+            --ft-release "${{ github.event.inputs.ft_release || 'v3.4.0' }}"
+
+      - name: 生成图表并提交
+        if: always()
+        env:
+          LEVELS_INPUT: ${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}
+        run: |
+          mkdir -p results/latest
+          shopt -s nullglob
+          for mode in http tcp; do
+            csv="out/exp/results-${mode}.csv"
+            if [ -f "$csv" ]; then
+              python3 bench/exp/chart.py --csv "$csv" --out "results/latest/chart-${mode}.png" --mode "$mode" --levels "$LEVELS_INPUT"
+              cp "$csv" "results/latest/results-${mode}.csv"
+            fi
+          done
+          if [ -n "$(git status --porcelain results/latest)" ]; then
+            git config user.name "bench-bot"
+            git config user.email "bench-bot@users.noreply.github.com"
+            git add results/latest
+            git commit -q -m "chore(bench): charts for run #${{ github.run_number }}"
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "没有可提交的图表"
+          fi
+
+      - name: 生成 Issue 正文
+        if: always()
+        run: |
+          raw="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME"
+          {
+            echo "**Runner**：$(nproc) 核 / $(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo) GB / $(uname -srm)"
+            echo "**参数**：levels=${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}，connections=${{ github.event.inputs.connections || '128' }}，duration=${{ github.event.inputs.duration || '10' }}s，prewarm=${{ github.event.inputs.prewarm || '10' }}s"
+            echo "**运行**：[#${{ github.run_number }}]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+            echo
+            echo "> 两侧同一种代理方式（http 对 http、tcp 对 tcp），健康检查通过后先预热再测量。"
+            echo "> runner 为共享 vCPU，绝对数值仅作趋势参考。"
+            echo
+            for mode in http tcp; do
+              chart="results/latest/chart-${mode}.png"
+              report="out/exp/report-${mode}.md"
+              [ -f "$report" ] || continue
+              echo "## ${mode} 模式"
+              echo
+              if [ -f "$chart" ]; then
+                echo "![${mode}](${raw}/${chart}?v=${{ github.run_number }})"
+                echo
+              fi
+              echo "<details><summary>展开明细（数据表 / 原始 CSV）</summary>"
+              echo
+              cat "$report"
+              echo
+              if [ -f "out/exp/results-${mode}.csv" ]; then
+                echo '```'
+                cat "out/exp/results-${mode}.csv"
+                echo '```'
+              fi
+              echo
+              echo "</details>"
+              echo
+            done
+            # 失败时把隧道日志贴进 issue，方便在无 admin 权限时排障
+            if ! ls out/exp/report-http.md out/exp/report-tcp.md >/dev/null 2>&1; then
+              echo "## 排障信息（失败）"
+              echo
+              echo '```'
+              ss -ltnp 2>/dev/null | head -n 20
+              echo '```'
+              for log in out/exp/run/*.log; do
+                [ -s "$log" ] || continue
+                echo "<details><summary>$(basename "$log")</summary>"
+                echo
+                echo '```'
+                tail -n 30 "$log"
+                echo '```'
+                echo
+                echo "</details>"
+              done
+            fi
+          } > issue-body.md
+          head -n 40 issue-body.md
+
+      # 每次运行都新建一条 issue，方便按时间线对比历史；不再往旧 issue 里追加评论
+      - name: 创建报告 Issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODE_INPUT: ${{ github.event.inputs.mode || 'both' }}
+          LEVELS_INPUT: ${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}
+        run: |
+          gh label create bench-report --color 0E8A16 --description '自动压测报告' 2>/dev/null || true
+          title="[bench] $(date -u '+%Y-%m-%d %H:%M') UTC · run #${{ github.run_number }} · ${MODE_INPUT} · ${LEVELS_INPUT}"
+          url=$(gh issue create --title "$title" --body-file issue-body.md --label bench-report)
+          echo "已创建：$url"
+          echo "$url" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传原始数据与日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            out/exp/report-http.md
+            out/exp/report-tcp.md
+            out/exp/results-http.csv
+            out/exp/results-tcp.csv
+            out/exp/results/*.json
+            out/exp/run/*.log
+            issue-body.md

@@ -1,0 +1,9 @@
+# 生成物
+out/
+bin/
+obj/
+*.user
+*.log
+*.err
+# 压测结果（results/ 里只保留归档样例）
+!results/
