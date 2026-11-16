@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""把 bench.sh 产出的 results-<mode>.csv 画成 PNG：左柱状=达成 RPS，右折线=p99。"""
+"""把 bench.sh 产出的 results-<mode>.csv 画成 PNG，四个面板：
+上1 吞吐柱状（成功 RPS/PPS）+ p99 折线；下 内存折线 + CPU 折线。
+内存/CPU 均按「服务端 / 客户端」拆成两条线，颜色区分 ft/frp，实线=服务端、虚线=客户端。
+"""
 import argparse
 import csv
 import os
@@ -33,20 +36,25 @@ def load_font(size, bold=False):
 
 
 def read(path):
-    """返回 (series, saturated, legacy)。
+    """返回 (series, saturated, legacy, cpu_split)。
 
-    series[framework] = [(目标 RPS, 成功 RPS, p99), ...]
-    吞吐取 SuccessRps（只数 200）；老 CSV 没有这一列时退回 AchievedRps 并标注口径。
-    同一档位可能有多轮（--rounds），取中位数。
-    saturated = {(framework, 目标 RPS)}，表示这一档没真正压上去。
+    series[framework][target] = {
+        success, p99,              # 吞吐 / 延迟（多轮取中位数）
+        srv_mem, cli_mem,          # 服务端 / 客户端内存 MB
+        srv_cpu, cli_cpu,          # 服务端 / 客户端 CPU 核数
+    }
+    cpu_split=True 表示 CSV 有独立的 ServerCores/ClientCores 列；
+    否则 CPU 只有旧的 TotalCores，回退成「合计」单线（cli_cpu=0，图上不画客户端线）。
+    saturated = {(framework, target)} 表示该档没真正压上去。
     """
     with open(path, newline="", encoding="utf-8") as fh:
         rows = [r for r in csv.DictReader(fh) if (r.get("SuccessRps") or r.get("AchievedRps"))]
     if not rows:
-        return {}, set(), False
+        return {}, set(), False, False
 
     legacy = not rows[0].get("SuccessRps")
     success_key = "AchievedRps" if legacy else "SuccessRps"
+    cpu_split = any("ServerCores" in row and row.get("ServerCores") not in (None, "") for row in rows)
 
     grouped = {}
     for row in rows:
@@ -59,25 +67,47 @@ def read(path):
     series = {}
     saturated = set()
     for (framework, target), group in grouped.items():
-        success = median_of(group, success_key)
-        p99 = median_of(group, "P99")
-        series.setdefault(framework, []).append((target, success, p99))
-        if median_of(group, "LateSend") > 5 or success < target * 0.95:
+        m = {
+            "success": median_of(group, success_key),
+            "p99": median_of(group, "P99"),
+            "srv_mem": median_of(group, "ServerMemMB"),
+            "cli_mem": median_of(group, "ClientMemMB"),
+        }
+        if cpu_split:
+            m["srv_cpu"] = median_of(group, "ServerCores")
+            m["cli_cpu"] = median_of(group, "ClientCores")
+        else:
+            m["srv_cpu"] = median_of(group, "TotalCores")
+            m["cli_cpu"] = None  # 无客户端拆分，画图时跳过
+        series.setdefault(framework, {})[target] = m
+        if median_of(group, "LateSend") > 5 or m["success"] < target * 0.95:
             saturated.add((framework, target))
+    return series, saturated, legacy, cpu_split
 
-    for key in series:
-        series[key].sort()
-    return series, saturated, legacy
+
+def dashed_line(draw, pts, fill, width=2, dash=7, gap=5):
+    """PIL 无原生虚线，手动逐段画。"""
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        dx, dy = x2 - x1, y2 - y1
+        length = (dx * dx + dy * dy) ** 0.5
+        if length == 0:
+            continue
+        t = 0.0
+        while t < length:
+            t2 = min(t + dash, length)
+            draw.line([(x1 + dx * t / length, y1 + dy * t / length),
+                       (x1 + dx * t2 / length, y1 + dy * t2 / length)], fill=fill, width=width)
+            t = t2 + gap
 
 
 def draw(csv_path, out_path, mode, levels):
-    series, saturated, legacy = read(csv_path)
+    series, saturated, legacy, cpu_split = read(csv_path)
     frameworks = [f for f in ("ft", "frp") if f in series] or list(series)
     colors = {frameworks[0]: C_FT}
     if len(frameworks) > 1:
         colors[frameworks[1]] = C_FRP
 
-    width, height = 1000, 620
+    width, height = 1000, 1020
     img = Image.new("RGB", (width, height), "white")
     d = ImageDraw.Draw(img)
     f_title, f_lbl, f_val, f_note = load_font(24, True), load_font(13), load_font(12, True), load_font(12)
@@ -87,32 +117,38 @@ def draw(csv_path, out_path, mode, levels):
     rate_unit = "PPS" if is_udp else "RPS"
     metric_note = ("成功 PPS（只数有效 echo）" if is_udp else "成功 RPS（只数 200 响应）") if not legacy \
         else "达成 RPS（旧口径，含非 200）"
-    d.text((40, 24), f"FastTunnel vs frp · {mode.upper()} 模式", font=f_title, fill=FG)
-    d.text((40, 58), f"目标档位 {levels} {rate_unit}  ·  {conns_note}  ·  每档先预热再测量", font=f_note, fill=GRAY)
+    d.text((40, 20), f"FastTunnel vs frp · {mode.upper()} 模式", font=f_title, fill=FG)
+    d.text((40, 54), f"目标档位 {levels} {rate_unit}  ·  {conns_note}  ·  每档先预热再测量", font=f_note, fill=GRAY)
 
     left, right = 90, width - 40
-    targets = sorted({t for rows in series.values() for (t, _, _) in rows})
-    max_rps = max(1.0, max(a for rows in series.values() for (_, a, _) in rows)) * 1.18
+    targets = sorted({t for by_target in series.values() for t in by_target})
 
-    # ---- 上：柱状 ----
-    top, bottom = 105, 360
-    d.text((40, 80), f"吞吐：{metric_note} → 柱越高越好（† = 这一档没压满，延迟数字偏乐观）", font=f_lbl, fill=FG)
-    if is_udp:
-        d.text((40, height - 54), "UDP 口径：错误率 ≈ 丢包率，延迟 = 逐包 RTT；明细见 report-udp.md 的丢包率列", font=f_note, fill=GRAY)
+    # 图例（右上）：颜色=框架，线型=服务端/客户端
+    lx, ly = right - 250, 22
+    for idx, fw in enumerate(frameworks):
+        d.rectangle([lx + idx * 96, ly, lx + idx * 96 + 12, ly + 12], fill=colors[fw])
+        d.text((lx + idx * 96 + 18, ly - 2), fw, font=f_lbl, fill=FG)
+    d.line([(lx, ly + 24), (lx + 20, ly + 24)], fill=FG, width=3)
+    d.text((lx + 26, ly + 17), "服务端", font=f_lbl, fill=FG)
+    dashed_line(d, [(lx + 110, ly + 24), (lx + 130, ly + 24)], FG, width=3)
+    d.text((lx + 136, ly + 17), "客户端", font=f_lbl, fill=FG)
+
+    # ================= Panel 1：吞吐柱状 =================
+    top, bottom = 122, 296
+    d.text((40, 98), f"吞吐：{metric_note} → 柱越高越好（† = 这一档没压满，延迟数字偏乐观）", font=f_lbl, fill=FG)
+    max_rps = max(1.0, max(m["success"] for by_target in series.values() for m in by_target.values())) * 1.18
     for frac in range(0, 5):
         y = bottom - (bottom - top) * frac / 4
         d.line([(left, y), (right, y)], fill=LIGHT)
         d.text((left - 8, y - 7), f"{int(max_rps * frac / 4 / 1000)}k", font=f_lbl, fill=GRAY, anchor="ra")
-
     group = (right - left) / max(1, len(targets))
     bar = group * 0.28
     for i, target in enumerate(targets):
         cx = left + group * (i + 0.5)
         for j, fw in enumerate(frameworks):
-            hit = [a for (t, a, _) in series[fw] if t == target]
-            if not hit:
+            if target not in series[fw]:
                 continue
-            value = hit[0]
+            value = series[fw][target]["success"]
             mark = "†" if (fw, target) in saturated else ""
             x0 = cx - bar - 3 + j * (bar + 6)
             y0 = bottom - (bottom - top) * value / max_rps
@@ -120,35 +156,67 @@ def draw(csv_path, out_path, mode, levels):
             d.text(((x0 + x0 + bar) / 2, y0 - 17), f"{value / 1000:.1f}k{mark}", font=f_val, fill=colors[fw], anchor="ma")
         d.text((cx, bottom + 6), f"{target // 1000}k", font=f_lbl, fill=GRAY, anchor="ma")
 
-    # ---- 下：p99 ----
-    top2, bottom2 = 430, 560
-    d.text((40, 402), "延迟：p99，单位毫秒（99% 的请求快于此值）→ 线越低越好", font=f_lbl, fill=FG)
-    max_p99 = max(1.0, max(p for rows in series.values() for (_, _, p) in rows)) * 1.25
+    # ================= 通用折线面板 =================
+    def line_panel(label_y, plot_top, plot_bottom, title, key_srv, key_cli, fmt):
+        d.text((40, label_y), title, font=f_lbl, fill=FG)
+        values = [m[key] for by_target in series.values() for m in by_target.values()
+                  for key in (key_srv, key_cli) if m.get(key) is not None]
+        max_v = max(values) * 1.25 if values else 1.0
+        max_v = max(max_v, 0.0001)
+        for frac in range(0, 5):
+            y = plot_bottom - (plot_bottom - plot_top) * frac / 4
+            d.line([(left, y), (right, y)], fill=LIGHT)
+            d.text((left - 8, y - 7), fmt(max_v * frac / 4), font=f_lbl, fill=GRAY, anchor="ra")
+        for fw in frameworks:
+            # 服务端：实线 + 实心点
+            pts_srv = [(left + group * (i + 0.5),
+                        plot_bottom - (plot_bottom - plot_top) * series[fw][t][key_srv] / max_v)
+                       for i, t in enumerate(targets) if t in series[fw]]
+            if len(pts_srv) > 1:
+                d.line(pts_srv, fill=colors[fw], width=3)
+            for x, y in pts_srv:
+                d.ellipse([x - 4, y - 4, x + 4, y + 4], fill=colors[fw])
+            # 客户端：虚线 + 空心点（无拆分列时跳过）
+            pts_cli = []
+            if key_cli in ("cli_cpu", "cli_mem"):
+                pts_cli = [(left + group * (i + 0.5),
+                            plot_bottom - (plot_bottom - plot_top) * series[fw][t][key_cli] / max_v)
+                           for i, t in enumerate(targets)
+                           if t in series[fw] and series[fw][t].get(key_cli) is not None]
+            if len(pts_cli) > 1:
+                dashed_line(d, pts_cli, colors[fw], width=3)
+            for x, y in pts_cli:
+                d.ellipse([x - 4, y - 4, x + 4, y + 4], fill="white", outline=colors[fw], width=2)
+
+    # ================= Panel 2：p99（框架级，无服务端/客户端之分） =================
+    p99_top, p99_bottom = 360, 486
+    d.text((40, 336), "延迟：p99，单位毫秒（99% 的请求快于此值）→ 线越低越好", font=f_lbl, fill=FG)
+    max_p99 = max(1.0, max(m["p99"] for by_target in series.values() for m in by_target.values())) * 1.25
     for frac in range(0, 5):
-        y = bottom2 - (bottom2 - top2) * frac / 4
+        y = p99_bottom - (p99_bottom - p99_top) * frac / 4
         d.line([(left, y), (right, y)], fill=LIGHT)
         d.text((left - 8, y - 7), f"{max_p99 * frac / 4:.0f}", font=f_lbl, fill=GRAY, anchor="ra")
-
     for fw in frameworks:
-        pts = []
-        for i, target in enumerate(targets):
-            hit = [p for (t, _, p) in series[fw] if t == target]
-            if not hit:
-                continue
-            pts.append((left + group * (i + 0.5), bottom2 - (bottom2 - top2) * hit[0] / max_p99))
+        pts = [(left + group * (i + 0.5), p99_bottom - (p99_bottom - p99_top) * series[fw][t]["p99"] / max_p99)
+               for i, t in enumerate(targets) if t in series[fw]]
         if len(pts) > 1:
             d.line(pts, fill=colors[fw], width=3)
         for x, y in pts:
             d.ellipse([x - 4, y - 4, x + 4, y + 4], fill=colors[fw])
 
-    # 图例
-    lx = right - 210
-    for idx, fw in enumerate(frameworks):
-        y = 88 + idx * 18
-        d.rectangle([lx, y, lx + 12, y + 12], fill=colors[fw])
-        d.text((lx + 18, y - 2), fw, font=f_lbl, fill=FG)
+    # ================= Panel 3：内存（服务端/客户端） =================
+    line_panel(514, 538, 672, "内存：VmRSS 合计，单位 MB（服务端实线 / 客户端虚线）→ 越低越省",
+               "srv_mem", "cli_mem", lambda v: f"{v:.0f}")
 
-    # ---- 底注：谁没压满 ----
+    # ================= Panel 4：CPU（服务端/客户端） =================
+    cpu_title = "CPU：核心数（服务端实线 / 客户端虚线）→ 越低越省"
+    if not cpu_split:
+        cpu_title += "　※ 旧数据无拆分列，实线为合计"
+    line_panel(700, 724, 858, cpu_title, "srv_cpu", "cli_cpu", lambda v: f"{v:.1f}")
+
+    # ================= 底注 =================
+    if is_udp:
+        d.text((40, height - 58), "UDP 口径：错误率 ≈ 丢包率，延迟 = 逐包 RTT；明细见 report-udp.md 的丢包率列", font=f_note, fill=GRAY)
     behind = sorted({(fw, t) for (fw, t) in saturated})
     if behind:
         detail = "、".join(f"{fw} {t // 1000}k" for (fw, t) in behind)

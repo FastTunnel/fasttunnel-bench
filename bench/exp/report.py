@@ -14,8 +14,8 @@ import statistics
 import sys
 
 HEADER = ["Framework", "TargetRps", "Connections", "Round", "SuccessRps", "AchievedRps",
-          "ErrorRate", "LateSend", "ConnectFails", "P50", "P99", "P999", "MiBps",
-          "TotalCores", "ServerMemMB", "ClientMemMB", "TotalMemMB"]
+          "ErrorRate", "LateSend", "ConnectFails", "P50", "P99", "P999", "MiBps", "LossRate",
+          "ServerCores", "ClientCores", "TotalCores", "ServerMemMB", "ClientMemMB", "TotalMemMB"]
 
 # 落后中位数超过这个比例算「节奏落后」；成功速率低于目标 95% 算「掉队」
 LATE_THRESHOLD = 5.0

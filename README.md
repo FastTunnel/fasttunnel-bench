@@ -58,7 +58,7 @@ raw samples: [`results/`](results/) · chart: [`docs/tweet-chart.png`](docs/twee
 ## CI / 自动压测（GitHub Actions）
 
 `.github/workflows/bench.yml`：**手动触发**（Actions → `bench` → Run workflow）+ **每周日 03:00 UTC 定时触发**，
-可配 `levels`（HTTP/TCP 的 RPS 阶梯）/ `udp_levels`（UDP 的 PPS 阶梯，默认 `1000,3000,5000,10000,20000`，与 RPS 独立避免高档位压不满）/ 并发 /
+可配 `levels`（HTTP/TCP 的 RPS 阶梯）/ `udp_levels`（UDP 的 PPS 阶梯，默认 `1000,3000,5000,10000,20000,30000,40000,50000`，与 RPS 独立避免高档位压不满）/ 并发 /
 `auto_connections`（并发随档位放大，默认 `1`）/ `rounds`（默认 `3`，奇偶轮交换两侧先后）/ `frp_pool`
 （frp 双侧连接池，默认 `0` = 出厂默认）/ `mode`（`all`=三种都跑，**默认** / `http` / `tcp` / `udp` / `both`=仅 http+tcp）。
 默认与定时触发都跑全部三种模式（含 UDP）。跑完自动把结果发成**一条新 issue**（标签 `bench-report`，按时间线可对比），原始数据作为 artifact 上传。
@@ -93,7 +93,7 @@ CI 每次运行都会刷新这两张图（横轴=目标 RPS 档位，柱=成功�
 
 ![tcp](https://raw.githubusercontent.com/FastTunnel/fasttunnel-bench/main/results/latest/chart-tcp.png)
 
-**UDP 模式**：FastTunnel Forwards(UDP) vs frp `type=udp`（柱状=成功 PPS，线=p99 RTT）
+**UDP 模式**：FastTunnel Forwards(UDP) vs frp `type=udp`（四面板：柱状=成功 PPS、p99 RTT、内存 VmRSS、CPU 核心数；后两者按服务端实线/客户端虚线拆分）
 
 ![udp](https://raw.githubusercontent.com/FastTunnel/fasttunnel-bench/main/results/latest/chart-udp.png)
 
@@ -144,7 +144,7 @@ powershell -ExecutionPolicy Bypass -File bench\exp\compare-tcp.ps1 -LevelsCsv 50
 #    （Windows 本地；需要本机已有 ft-server/ft-client 二进制）
 powershell -ExecutionPolicy Bypass -File bench\exp\compare-udp.ps1 -LevelsCsv 5000,10000,30000
 #    Linux / CI 走 bench.sh：
-bash bench/exp/bench.sh udp --levels 5000,10000,30000 --rounds 3
+bash bench/exp/bench.sh udp --levels 1000,5000,10000,20000,30000,40000,50000 --rounds 3
 
 # 6) chart for a post
 python bench\exp\make-tweet-chart.py

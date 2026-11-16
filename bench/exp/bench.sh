@@ -394,21 +394,24 @@ conns_for() {
 run_once() {
     local framework="$1" port="$2" host="$3" level="$4" server_pid="$5" client_pid="$6" round="$7" conns="$8"
     local out="${OUT}/results/${framework}-${level}-r${round}.json"
-    local cpu0 cpu1 rss_s rss_c hz
-    cpu0=$(( $(proc_cpu_ticks "${server_pid}") + $(proc_cpu_ticks "${client_pid}") ))
+    local cpu_s0 cpu_s1 cpu_c0 cpu_c1 rss_s rss_c hz
+    cpu_s0=$(proc_cpu_ticks "${server_pid}")
+    cpu_c0=$(proc_cpu_ticks "${client_pid}")
 
     mapfile -d '' -t runner_args < <(load_once_args "${port}" "${host}" "${level}" "${conns}" \
         "${WARMUP}" "${DURATION}" "${out}" "${framework}-${level}")
     "${RUNNER}" "${runner_args[@]}" >/dev/null
 
-    cpu1=$(( $(proc_cpu_ticks "${server_pid}") + $(proc_cpu_ticks "${client_pid}") ))
+    cpu_s1=$(proc_cpu_ticks "${server_pid}")
+    cpu_c1=$(proc_cpu_ticks "${client_pid}")
     rss_s=$(proc_rss_mb "${server_pid}")
     rss_c=$(proc_rss_mb "${client_pid}")
     hz=$(getconf CLK_TCK)
 
-    python3 - "${out}" "${framework}" "${level}" "${conns}" "${round}" "$((cpu1-cpu0))" "${hz}" "${rss_s}" "${rss_c}" "${WARMUP}" <<'PY'
+    python3 - "${out}" "${framework}" "${level}" "${conns}" "${round}" \
+        "$((cpu_s1-cpu_s0))" "$((cpu_c1-cpu_c0))" "${hz}" "${rss_s}" "${rss_c}" "${WARMUP}" <<'PY'
 import json, sys
-path, fw, level, conns, rnd, ticks, hz, rss_s, rss_c, warmup = sys.argv[1:11]
+path, fw, level, conns, rnd, ticks_s, ticks_c, hz, rss_s, rss_c, warmup = sys.argv[1:12]
 d = json.load(open(path))
 dur = max(0.001, float(d.get("DurationSeconds", 0)) + float(warmup))
 print(",".join([
@@ -426,7 +429,10 @@ print(",".join([
     f'{d.get("ThroughputMiBps", 0):.3f}',
     # 丢包率只对 UDP 有意义；HTTP/TCP 的 JSON 没有这个字段，默认 0
     f'{d.get("LossRate", 0) * 100:.2f}',
-    f'{int(ticks) / int(hz) / dur:.2f}',
+    # CPU 拆服务端/客户端；TotalCores 保留为合计，兼容 report.py 的旧列
+    f'{int(ticks_s) / int(hz) / dur:.2f}',
+    f'{int(ticks_c) / int(hz) / dur:.2f}',
+    f'{(int(ticks_s) + int(ticks_c)) / int(hz) / dur:.2f}',
     rss_s, rss_c, f'{float(rss_s) + float(rss_c):.1f}',
 ]))
 PY
@@ -494,7 +500,7 @@ else
 fi
 
 CSV="${OUT}/results-${MODE}.csv"
-echo 'Framework,TargetRps,Connections,Round,SuccessRps,AchievedRps,ErrorRate,LateSend,ConnectFails,P50,P99,P999,MiBps,LossRate,TotalCores,ServerMemMB,ClientMemMB,TotalMemMB' > "${CSV}"
+echo 'Framework,TargetRps,Connections,Round,SuccessRps,AchievedRps,ErrorRate,LateSend,ConnectFails,P50,P99,P999,MiBps,LossRate,ServerCores,ClientCores,TotalCores,ServerMemMB,ClientMemMB,TotalMemMB' > "${CSV}"
 
 first_level="${LEVELS%%,*}"
 prewarm ft "${ft_entry_port}" "${FT_HOST}" "${FT_SERVER_PID}" "${FT_CLIENT_PID}" "$(conns_for "${first_level}")"
