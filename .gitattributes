@@ -1,0 +1,2 @@
+# CI 里 bench.sh 是 bash 直接执行的，Windows 上 core.autocrlf=true 会把它换成 CRLF 导致 `bad interpreter`
+*.sh text eol=lf

@@ -48,17 +48,16 @@ $ErrorActionPreference = 'Stop'
 $Levels = @($LevelsCsv -split '[,\s;]+' | Where-Object { $_ } | ForEach-Object { [int]$_ })
 if ($Levels.Count -eq 0) { throw '-LevelsCsv 为空' }
 
-# 池要跟着最大并发走：HTTP 代理每条用户连接要一条 work connection，池小于并发时多出来的连接
-# 每请求现建一条，测到的就不是 frp 的正常表现（和「只调客户端被服务端夹回 5」是同一类不公平）。
+# 池默认走出厂配置（frpc 1 / frps 5）。实测（本机配对 + CI run #45）把双侧池调到并发数
+# 并没有让 frp 的 http 模式变好，反而更差，所以这里只提示、不擅自改用户传进来的值。
 $frpPoolNote = ''
 if ($FrpPoolCount -gt 0) {
     $maxLevelConns = if ($AutoConnections) {
         [int](($Levels | ForEach-Object { [math]::Min($MaxAutoConnections, [math]::Max(64, [int]($_ / 50))) }) | Measure-Object -Maximum).Maximum
     } else { $Connections }
     if ($FrpPoolCount -lt $maxLevelConns) {
-        $frpPoolNote = "（已按本轮最大并发 $maxLevelConns 上调）"
-        Write-Host "==> frp 连接池 $FrpPoolCount 小于本轮最大并发 $maxLevelConns，已自动上调避免把 frp 测残" -ForegroundColor Yellow
-        $FrpPoolCount = $maxLevelConns
+        $frpPoolNote = "（本轮最大并发 $maxLevelConns，未调平）"
+        Write-Host "==> frp 连接池 $FrpPoolCount 小于本轮最大并发 $maxLevelConns：多出来的 work connection 会被 frps 丢弃，要完全调平请传更大的 -FrpPoolCount" -ForegroundColor Yellow
     }
 }
 

@@ -25,9 +25,10 @@ ROUNDS="1"
 # p99 会偏乐观。默认让并发随档位放大（目标 RPS / 50，上限 1024）。
 AUTO_CONNS="1"
 MAX_AUTO_CONNS="1024"
-# frp 连接池：auto = 调平到本轮最大并发（frpc poolCount + frps maxPoolCount 一起写）；
-# 0 = 出厂默认（1 / 5），只用于「想看 frp 出厂表现」的对照。
-FRP_POOL="auto"
+# frp 连接池：0 = 出厂默认（frpc poolCount=1 / frps maxPoolCount=5），和用户在官网下到的那份一致；
+# auto = 双侧调平到本轮最大并发，数字 = 双侧都写这个值。调平实测并没有让 frp 变好（见下面 pool_need 处注释），
+# 所以只在显式做这个实验时才传。
+FRP_POOL="0"
 FRAMEWORKS="ft,frp"
 FASTTUNNEL_ROOT="${FASTTUNNEL_ROOT:-}"
 FT_RELEASE=""
@@ -382,9 +383,12 @@ prewarm() {
 
 prepare
 
-# 本轮会用到的最大并发：frp 的池必须至少覆盖它。HTTP/TCP 代理都是「一条用户连接吃一条
-# work connection」，池小一点就多出来的连接每请求现建一条，测到的不是 frp 的正常表现
-# （和只调客户端、被服务端 maxPoolCount 夹回 5 是同一类不公平）。
+# frp 的连接池语义（2026-11-16 本机配对 + CI run #45 取证）：
+# - 出厂默认 frpc poolCount=1 / frps maxPoolCount=5，服务端会丢弃多余的 work connection
+#   （frps debug 日志 `work connection pool is full, discarding`）；
+# - 但把双侧池调到并发数（--frp-pool auto）并不让 frp 变好：http 模式下每档落后 100%、
+#   RSS 冲到 4020 MB，同一次运行的 tcp 模式同样池只有 394 MB、p50 0.185ms。
+# 所以默认走出厂配置（用户装完就是这份），调平只当显式实验。
 pool_need=${CONNECTIONS}
 for level in ${LEVELS//,/ }; do
     want=$(conns_for "${level}")
@@ -392,10 +396,9 @@ for level in ${LEVELS//,/ }; do
 done
 if [[ "${FRP_POOL}" == "auto" ]]; then
     FRP_POOL=${pool_need}
-    log "frp 连接池自动双侧调平到本轮最大并发 ${FRP_POOL}"
-elif [[ -n "${FRP_POOL}" && "${FRP_POOL}" != "0" ]] && (( FRP_POOL < pool_need )); then
-    log "frp 连接池 ${FRP_POOL} 小于本轮最大并发 ${pool_need}，已上调；要用出厂默认请传 --frp-pool 0"
-    FRP_POOL=${pool_need}
+    log "frp 连接池显式双侧调平到本轮最大并发 ${FRP_POOL}（出厂默认是 1 / 5）"
+elif [[ "${FRP_POOL}" != "0" && "${FRP_POOL}" != "auto" ]] && (( FRP_POOL < pool_need )); then
+    log "frp 连接池 ${FRP_POOL} 小于本轮最大并发 ${pool_need}（按传入值原样测；要完全调平用 --frp-pool auto）"
 fi
 
 write_configs

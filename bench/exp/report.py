@@ -4,7 +4,8 @@
 口径说明（与 bench/LoadRunner 输出一致）：
   SuccessRps  只数 200 响应 —— 跨框架对比看这一列
   AchievedRps 数所有拿到响应的请求，含隧道自己返回的非 200
-  LateSend    发送时刻晚于计划 5ms 以上的请求占比；不为 0 说明这一档没真正压上去
+  LateSend    发送时刻晚于计划 5ms 以上的请求占比；要和 SuccessRps 一起读——
+              成功速率达标时它只说明发送被排后（闭环自限速），没达标才是真的没压上去
 """
 import argparse
 import csv
@@ -16,7 +17,7 @@ HEADER = ["Framework", "TargetRps", "Connections", "Round", "SuccessRps", "Achie
           "ErrorRate", "LateSend", "ConnectFails", "P50", "P99", "P999", "MiBps",
           "TotalCores", "ServerMemMB", "ClientMemMB", "TotalMemMB"]
 
-# 落后超过这个比例，或成功速率低于目标的 95%，就认定这一档没压满
+# 落后中位数超过这个比例算「节奏落后」；成功速率低于目标 95% 算「掉队」
 LATE_THRESHOLD = 5.0
 ACHIEVE_RATIO = 0.95
 
@@ -61,8 +62,17 @@ def median(rows, key, digits=1):
     return num(statistics.median(values), digits) if values else "-"
 
 
-def is_saturated(row):
-    return f(row.get("LateSend")) > LATE_THRESHOLD or f(row.get("SuccessRps")) < f(row.get("TargetRps")) * ACHIEVE_RATIO
+def group_state(group):
+    """按中位数分两种状态：(掉队, 节奏落后)。
+
+    掉队 = 成功 RPS 没到目标 95%，这一档的吞吐和延迟都不能引用。
+    节奏落后 = 吞吐达标但发送被排在计划之后（闭环自限速，恒定偏移也会全量命中），
+    吞吐可引用，p99 是限速后的观测值、偏乐观。
+    """
+    target = f(group[0].get("TargetRps"))
+    late = f(median(group, "LateSend")) > LATE_THRESHOLD
+    shortfall = target > 0 and f(median(group, "SuccessRps")) < target * ACHIEVE_RATIO
+    return shortfall, (late and not shortfall)
 
 
 def pct(text):
@@ -78,9 +88,10 @@ def header_lines(args, rows):
     lines += [f'- 目标 RPS：{args.levels}',
               f'- 并发连接：{"随档位自适应（目标 RPS / 50，上限 1024）" if args.auto_connections == "1" else f"固定 {args.connections}"}',
               f'- 轮数：{args.rounds}（奇偶轮交换两侧先后）',
-              f'- frp 连接池：{"双侧调平到 " + args.frp_pool if args.frp_pool != "0" else "出厂默认（frpc poolCount=1 / frps maxPoolCount=5）"}', ""]
+              f'- frp 连接池：{"双侧调平到 " + args.frp_pool + "（非出厂配置）" if args.frp_pool != "0" else "出厂默认（frpc poolCount=1 / frps maxPoolCount=5）"}', ""]
     lines += ["> **成功 RPS** 只数 200 响应，跨框架对比看这一列；**达成 RPS** 含隧道自己返回的非 200。",
-              "> **落后** 不为 0 说明发压没按计划发出，这一档的 p99 偏乐观，不能当体验结论。", ""]
+              "> **落后** 不为 0 只说明发送被排在计划之后：成功 RPS 同时达标的话吞吐仍可引用（p99 偏乐观），"
+              "没达标就是这一档没压上去，两组数字都不能引用。", ""]
     return lines
 
 
@@ -128,18 +139,30 @@ def render_compare(rows, args):
                      f"{median(group, 'P50', 3)} | {median(group, 'P99', 3)} | "
                      f"{median(group, 'TotalMemMB')} |")
 
-    saturated = [(framework, level) for (framework, level), group in grouped.items()
-                 if any(is_saturated(row) for row in group)]
-    if saturated:
-        lines += ["", "## 未压满的档位（这些行的 p99 不能当结论）", "",
+    states = {key: group_state(group) for key, group in grouped.items()}
+    short = [key for key, (shortfall, _) in states.items() if shortfall]
+    lag = [key for key, (_, behind) in states.items() if behind]
+    if short:
+        lines += ["", "## 未压满的档位（成功 RPS 没到目标 95%，这些行的吞吐与 p99 都不能当结论）", "",
                   "| 框架 | 目标 RPS | 并发 | 轮数 | 成功 RPS(中位) | 落后(中位) |",
                   "|---|---|---|---|---|---|"]
-        for (framework, level) in sorted(saturated, key=lambda x: (x[0], int(x[1]))):
+        for (framework, level) in sorted(short, key=lambda x: (x[0], int(x[1]))):
             group = grouped[(framework, level)]
             lines.append(f"| {framework} | {level} | {group[0]['Connections']} | {len(group)} | "
                          f"{median(group, 'SuccessRps')} | {pct(median(group, 'LateSend', 2))} |")
         lines += ["", "> 实际发压 ≈ 并发数 ÷ 平均延迟。要测真实上限就加大并发（`--auto-connections 1` 已默认开启），"
                   "只把目标 RPS 往上抬是压不上去的。"]
+    if lag:
+        lines += ["", "## 节奏落后的档位（吞吐已达目标，但发送被排在计划之后）", "",
+                  "| 框架 | 目标 RPS | 并发 | 轮数 | 成功 RPS(中位) | 落后(中位) | p99 |",
+                  "|---|---|---|---|---|---|---|"]
+        for (framework, level) in sorted(lag, key=lambda x: (x[0], int(x[1]))):
+            group = grouped[(framework, level)]
+            lines.append(f"| {framework} | {level} | {group[0]['Connections']} | {len(group)} | "
+                         f"{median(group, 'SuccessRps')} | {pct(median(group, 'LateSend', 2))} | "
+                         f"{median(group, 'P99', 3)} |")
+        lines += ["", "> 这一类是闭环发压自己限了速（并发 ÷ 延迟刚好够上目标，或启动偏移一直没过阈值）："
+                  "**成功 RPS 可以引用，p99 是限速之后的观测值、偏乐观**。"]
     return lines
 
 

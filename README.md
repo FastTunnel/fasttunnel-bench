@@ -22,10 +22,15 @@ Single machine, loopback, IIS:8080 static 1KB page, 256 keep-alive connections, 
 ¹ 固定 256 并发 + 闭环发压下的**发压上限**（256 ÷ ~6ms ≈ 43K），不是链路吞吐上限；两侧都受同一约束。
 
 - Neither side errors out; beyond capacity they saturate (achieved stops tracking target, latency rises).
-- frp's `type=http` (vhost) is the weak spot: at high concurrency it opens ~one work connection **per request**
-  (debug log: 12 510 requests → 12 891 new work connections in 5s).
-- frp's `type=tcp` is roughly on par with FastTunnel at 10K; its ceiling and memory efficiency are lower.
-- frp memory is ~1.25–1.4× higher (private bytes, server+client).
+- frp's `type=http` (vhost) looked like the weak spot in the pre-revision runs: at high concurrency it opened
+  ~one work connection **per request** (debug log: 12 510 requests → 12 891 new work connections in 5s).
+  **That degradation did not reproduce** on the built-in origin with the same frp config (2026-11-16), so treat
+  it as an unresolved observation — see [Metric revision](#metric-revision--口径修订2026-11-16).
+- frp's `type=tcp` is roughly on par with FastTunnel at 10K; its throughput ceiling is lower.
+- Memory does **not** rank the same on both platforms: Windows *private bytes* put frp ~1.2–1.4× higher
+  (230–248 MB vs 172–217 MB), while the Linux CI *VmRSS* numbers run the other way — tcp mode, same run:
+  FastTunnel 652–877 MB vs frp 244–416 MB. Different metric, different allocator behaviour; don't quote a
+  winner across platforms.
 
 Full write-up: [`docs/report-final.md`](docs/report-final.md) · tweet drafts: [`docs/tweet.md`](docs/tweet.md) ·
 raw samples: [`results/`](results/) · chart: [`docs/tweet-chart.png`](docs/tweet-chart.png)
@@ -47,17 +52,19 @@ raw samples: [`results/`](results/) · chart: [`docs/tweet-chart.png`](docs/twee
 - ≥60K：数字停在 42.7K / 33.9K 且不再随目标上升 —— 这是 256 并发闭环发压的**发压上限**，
   不是链路上限（同一档位用 128 并发直连内置源站能跑到 ~50K）。要比较真实上限，
   用 `-AutoConnections 1`（默认已开）让并发随档位放大，并确认报表里「落后」为 0。
-- 内存：frp 两侧合计 230~248 MB，FastTunnel 172~217 MB，约 **1.2~1.4 倍**。
+- 内存：本机（Windows 私有字节）frp 两侧合计 230~248 MB，FastTunnel 172~217 MB，约 **1.2~1.4 倍**；
+  Linux CI 的 VmRSS 方向相反（ft 652~877 MB vs frp 244~416 MB），口径不同别混着引用。
 
 ## CI / 自动压测（GitHub Actions）
 
 `.github/workflows/bench.yml`：**手动触发**（Actions → `bench` → Run workflow），可配 RPS 阶梯 / 并发 /
 `auto_connections`（并发随档位放大，默认 `1`）/ `rounds`（默认 `3`，奇偶轮交换两侧先后）/ `frp_pool`
-（frp 双侧连接池，默认 `0` = 出厂默认）。跑完自动把结果发成 **issue**（同名标签的既有 issue 追加评论，不刷屏），
+（frp 双侧连接池，默认 `0` = 出厂默认）。跑完自动把结果发成**一条新 issue**（标签 `bench-report`，按时间线可对比），
 原始数据作为 artifact 上传。
 
-> `frp_pool` 现在同时写 frpc `transport.poolCount` 与 frps `transport.maxPoolCount`；只写客户端会被服务端
-> 的 `min()` 夹回 5（详见 [Fairness notes](#fairness-notes--公平性说明) 第 3 条）。
+> `frp_pool` 传数字或 `auto` 时**两侧一起写**（frpc `transport.poolCount` + frps `transport.maxPoolCount`）；
+> 只写客户端会被服务端的 `min()` 夹回 5。默认不调平的原因见
+> [Fairness notes](#fairness-notes--公平性说明) 第 3 条：调平实测让 frp 的 http 模式更差，不是更好。
 
 > 托管 runner 是共享 vCPU，存在 steal 与邻居噪声：CI 结果只用于"能跑通 + 相对趋势"，
 > 正式数字请在本机按上面的步骤跑。
@@ -163,10 +170,13 @@ out/                   generated (gitignored): published binaries, frp download,
 | ServerMemMB/ClientMemMB | **private bytes** (not RSS peak) at the end of the level |
 | SelfCores | CPU used by the load generator itself (so you can tell "tunnel slow" from "generator maxed") |
 
-> **LateSend 是读法的前提**：发压是「定速节奏 + 闭环执行」——每条连接收到响应才发下一条，
-> 所以实际发压 ≈ 并发数 ÷ 平均延迟。落后不为 0 的档位并没有按计划压上去，那一档的 p99 偏乐观。
-> 实测：源站人为放慢 20ms、16 并发、目标 2 000 RPS 时，达成 779 RPS（并发 ÷ 延迟 = 780）且落后 100%；
-> 同一档位健康时落后为 0。脚本默认 `-AutoConnections 1` 让并发随档位放大，就是为了把这一列压回 0。
+> **LateSend 要和 SuccessRps 一起读**：发压是「定速节奏 + 闭环执行」——每条连接收到响应才发下一条，
+> 所以实际发压 ≈ 并发数 ÷ 平均延迟。落后不为 0 有两种情况，报告已经分开列：
+> ① **成功速率没到目标** → 这一档真的没压上去，吞吐和 p99 都不能引用；
+> ② **成功速率达标但落后很高** → 发送整体排在计划之后（闭环自限速/启动偏移），吞吐可引用、p99 偏乐观。
+> 例：run #45 的 frp http 5 000 档成功 4 996.8（达标）但落后 100%，而同表 frp 10 000 档只有 6 312.5（没达标）。
+> 真正掉队的下限实测过：源站人为放慢 20ms、16 并发、目标 2 000 RPS 时达成 779 RPS（并发 ÷ 延迟 = 780）且落后 100%。
+> 脚本默认 `-AutoConnections 1` 让并发随档位放大，就是为了把这一列压回 0。
 
 ## Fairness notes / 公平性说明
 
@@ -175,11 +185,14 @@ out/                   generated (gitignored): published binaries, frp download,
    Because of mux you cannot count frp work connections from `netstat`; disable mux first if you want to.
 3. frp connection pool: frpc `transport.poolCount` defaults to **1**, frps `transport.maxPoolCount` to **5**, and
    the server **discards** the client's excess work connections (`frps` debug log: `work connection pool is full,
-   discarding` — 1 353 of them in one 10K/256 run when only the client was raised). So `-FrpPoolCount N` /
-   `--frp-pool N` writes **both** sides, and `--frp-pool auto` (CI default) levels them to the run's max concurrency.
-   This is a config-correctness fix, not a proven throughput lever: in one paired 10K/256 `type=http` run,
-   raising `maxPoolCount` from 5 to 256 changed nothing measurable — do **not** cite the pool as the explanation
-   for frp's HTTP-mode degradation.
+   discarding` — 1 353 of them in one 10K/256 run when only the client was raised). `-FrpPoolCount N` /
+   `--frp-pool N` writes **both** sides; `--frp-pool auto` levels them to the run's max concurrency.
+   **Both default to the stock pool now**, because leveling measured *worse* for frp, not better:
+   one paired 10K/256 `type=http` run gave 9 998 RPS / 0% err / p99 4.3ms at `maxPoolCount=5` vs
+   10 859 RPS / 0.96% err / p99 179ms at 256 (n=1), and CI run #45 with `--frp-pool auto` (=1000 both sides)
+   pushed frp's HTTP mode to 100% LateSend and 4 020 MB RSS while its TCP mode on the same pool stayed at
+   394 MB / p50 0.185ms / 0% LateSend. So leveling is an explicit experiment only — and do **not** cite the
+   pool as the explanation for frp's HTTP-mode degradation.
 4. Same origin, same Host header, same connection count, same RPS ladder; comparisons are **interleaved**
    (round → level → framework, with the order swapped on odd/even rounds) within one session to cancel machine drift,
    and multi-round medians are reported.
