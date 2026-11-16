@@ -57,10 +57,15 @@ raw samples: [`results/`](results/) · chart: [`docs/tweet-chart.png`](docs/twee
 
 ## CI / 自动压测（GitHub Actions）
 
-`.github/workflows/bench.yml`：**手动触发**（Actions → `bench` → Run workflow），可配 RPS 阶梯 / 并发 /
+`.github/workflows/bench.yml`：**手动触发**（Actions → `bench` → Run workflow）+ **每周日 03:00 UTC 定时触发**，
+可配 `levels`（HTTP/TCP 的 RPS 阶梯）/ `udp_levels`（UDP 的 PPS 阶梯，默认 `1000,3000,5000,10000,20000`，与 RPS 独立避免高档位压不满）/ 并发 /
 `auto_connections`（并发随档位放大，默认 `1`）/ `rounds`（默认 `3`，奇偶轮交换两侧先后）/ `frp_pool`
-（frp 双侧连接池，默认 `0` = 出厂默认）。跑完自动把结果发成**一条新 issue**（标签 `bench-report`，按时间线可对比），
-原始数据作为 artifact 上传。
+（frp 双侧连接池，默认 `0` = 出厂默认）/ `mode`（`all`=三种都跑，**默认** / `http` / `tcp` / `udp` / `both`=仅 http+tcp）。
+默认与定时触发都跑全部三种模式（含 UDP）。跑完自动把结果发成**一条新 issue**（标签 `bench-report`，按时间线可对比），原始数据作为 artifact 上传。
+
+> UDP 对照：两侧同一层（FastTunnel `Forwards[].Protocol=UDP` vs frp `type=udp`），共享同一个内置 UDP echo 源站，
+> 用带 `magic+seq+sendTicks` 的数据报测逐包 RTT 与丢包；吞吐列是**成功 PPS**（只数内容匹配的有效 echo），
+> 错误率≈丢包率。就绪探测走 `udpping`（curl 探不到 UDP）。三种模式端口互相错开，可单独跑也可 `all` 一起跑。
 
 > `frp_pool` 传数字或 `auto` 时**两侧一起写**（frpc `transport.poolCount` + frps `transport.maxPoolCount`）；
 > 只写客户端会被服务端的 `min()` 夹回 5。默认不调平的原因见
@@ -87,6 +92,12 @@ CI 每次运行都会刷新这两张图（横轴=目标 RPS 档位，柱=成功�
 **TCP 模式**：FastTunnel Forwards vs frp `type=tcp`
 
 ![tcp](https://raw.githubusercontent.com/FastTunnel/fasttunnel-bench/main/results/latest/chart-tcp.png)
+
+**UDP 模式**：FastTunnel Forwards(UDP) vs frp `type=udp`（柱状=成功 PPS，线=p99 RTT）
+
+![udp](https://raw.githubusercontent.com/FastTunnel/fasttunnel-bench/main/results/latest/chart-udp.png)
+
+> UDP 图只有在 CI 里用 `mode=udp` / `mode=all` 跑过一次后才会生成；未跑过时该链接 404 属正常。
 
 > 数据来自 GitHub Actions 的 4 vCPU 共享 runner（`ubuntu-latest`），
 > 两侧使用同一种代理方式、先预热再测量；绝对数值仅供趋势参考，
@@ -129,7 +140,13 @@ powershell -ExecutionPolicy Bypass -File bench\exp\run-experiment.ps1 -Framework
 # 4) FastTunnel(Forwards) vs frp(type=tcp), same proxy layer, with CPU + memory, interleaved 3 rounds
 powershell -ExecutionPolicy Bypass -File bench\exp\compare-tcp.ps1 -LevelsCsv 5000,10000,30000,60000,90000
 
-# 5) chart for a post
+# 5) UDP 对照: FastTunnel(Forwards UDP) vs frp(type=udp), same UDP echo origin, interleaved 3 rounds
+#    （Windows 本地；需要本机已有 ft-server/ft-client 二进制）
+powershell -ExecutionPolicy Bypass -File bench\exp\compare-udp.ps1 -LevelsCsv 5000,10000,30000
+#    Linux / CI 走 bench.sh：
+bash bench/exp/bench.sh udp --levels 5000,10000,30000 --rounds 3
+
+# 6) chart for a post
 python bench\exp\make-tweet-chart.py
 ```
 
@@ -144,10 +161,16 @@ FastTunnel path resolution: `-FastTunnelRoot <path>` → env `FASTTUNNEL_ROOT` �
 
 ```
 bench/LoadRunner/      load generator (open-loop pacing, per-request latency, Host header override)
+  Program.cs           HTTP request/response load mode + subcommand dispatch
+  UdpRunner.cs         UDP 三件套: serve-udp (echo 源站) / udpping (就绪探测) / udpload (定速 UDP 压测)
+  OriginServer.cs      built-in Kestrel HTTP origin
 bench/exp/             orchestration + IIS setup + charts
+  bench.sh             Linux/CI 主编排，mode=http|tcp|udp
   setup-iis-admin.ps1  deploy IIS page + hosts (admin, idempotent, rollback script included)
   run-experiment.ps1   staircase for ft / frp(http), CPU + memory + report.md + chart.svg
   compare-tcp.ps1      ft vs frp(type=tcp), interleaved, CPU + memory
+  compare-udp.ps1      ft vs frp(type=udp), interleaved, CPU + memory + 丢包率
+  report.py / chart.py CSV → Markdown 报告 / PNG 图表（三模式共用，udp 多一列丢包率）
   make-charts.ps1      SVG charts from results.csv
   make-tweet-chart.py  PNG chart (1200×800) for social posts
 docs/                  report, tweet drafts, chart
@@ -169,6 +192,7 @@ out/                   generated (gitignored): published binaries, frp download,
 | ServerCores/ClientCores | average CPU cores of the tunnel processes during the level |
 | ServerMemMB/ClientMemMB | **private bytes** (not RSS peak) at the end of the level |
 | SelfCores | CPU used by the load generator itself (so you can tell "tunnel slow" from "generator maxed") |
+| LossRate / LossCount | **UDP only**: datagrams with no matching echo / their share; HTTP/TCP have no such column |
 
 > **LateSend 要和 SuccessRps 一起读**：发压是「定速节奏 + 闭环执行」——每条连接收到响应才发下一条，
 > 所以实际发压 ≈ 并发数 ÷ 平均延迟。落后不为 0 有两种情况，报告已经分开列：
@@ -198,7 +222,11 @@ out/                   generated (gitignored): published binaries, frp download,
    and multi-round medians are reported.
 5. The load generator runs on the same machine as the tunnels; `SelfCores` is recorded for that reason.
 6. Both sides are measured on the same proxy layer: `http` mode is FastTunnel Web(vhost) vs frp `type=http`,
-   `tcp` mode is FastTunnel **Forwards** port forwarding vs frp `type=tcp`.
+   `tcp` mode is FastTunnel **Forwards** port forwarding vs frp `type=tcp`,
+   `udp` mode is FastTunnel **Forwards** (`Protocol=UDP`) vs frp `type=udp`.
+7. UDP mode shares one built-in echo origin across both tunnels; each worker is one UDP socket = one
+   source endpoint = one tunnel session on either side. Pacing/RPS ladder/round interleaving mirror the
+   TCP mode; `SuccessRps` there means successful echoes per second and `ErrorRate ≈ LossRate`.
 
 ## Metric revision / 口径修订（2026-11-16）
 

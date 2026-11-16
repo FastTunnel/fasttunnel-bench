@@ -92,18 +92,33 @@ def header_lines(args, rows):
     lines += ["> **成功 RPS** 只数 200 响应，跨框架对比看这一列；**达成 RPS** 含隧道自己返回的非 200。",
               "> **落后** 不为 0 只说明发送被排在计划之后：成功 RPS 同时达标的话吞吐仍可引用（p99 偏乐观），"
               "没达标就是这一档没压上去，两组数字都不能引用。", ""]
+    if args.mode_name == "udp":
+        lines += ["> UDP 模式下 RPS = **PPS**（每秒数据报），200 响应 = 收到内容匹配的有效 echo；"
+                  "**错误率 ≈ 丢包率**（没收到 echo 的数据报占比），延迟是逐包 RTT。", ""]
     return lines
+
+
+def has_loss(rows, args):
+    """只有 UDP 模式显示丢包率列。
+
+    bench.sh 三种模式共用一张 CSV 表头（都带 LossRate 列，HTTP/TCP 恒为 0），
+    所以除了列是否存在，还要看 mode-name，避免给 HTTP/TCP 报告挂一列无意义的 0%。
+    """
+    return args.mode_name == "udp" and bool(rows) and "LossRate" in rows[0]
 
 
 def render_ladder(rows, args):
     lines = header_lines(args, rows)
-    lines += ["| 框架 | 目标 RPS | 并发 | 成功 RPS | 达成 RPS | 错误率 | 落后 | MiB/s | p50 | p99 | 服务端内存(MB) | 客户端内存(MB) |",
-              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    extra = " 丢包率 |" if has_loss(rows, args) else ""
+    sep_extra = "---|" if has_loss(rows, args) else ""
+    lines += [f"| 框架 | 目标 RPS | 并发 | 成功 RPS | 达成 RPS | 错误率 | 落后 | MiB/s | p50 | p99 |{extra} 服务端内存(MB) | 客户端内存(MB) |",
+              f"|---|---|---|---|---|---|---|---|---|---|{sep_extra}---|---|"]
     for row in rows:
+        loss_cell = f" {pct(num(row.get('LossRate'), 2))} |" if has_loss(rows, args) else ""
         lines.append(f"| {row['Framework']} | {row['TargetRps']} | {row['Connections']} | "
                      f"{num(row['SuccessRps'])} | {num(row['AchievedRps'])} | "
                      f"{pct(num(row['ErrorRate'], 2))} | {pct(num(row.get('LateSend'), 2))} | "
-                     f"{num(row.get('MiBps'), 2)} | {num(row['P50'], 3)} | {num(row['P99'], 3)} | "
+                     f"{num(row.get('MiBps'), 2)} | {num(row['P50'], 3)} | {num(row['P99'], 3)} |{loss_cell} "
                      f"{num(row['ServerMemMB'])} | {num(row['ClientMemMB'])} |")
 
     by_level = {}
@@ -129,14 +144,17 @@ def render_compare(rows, args):
     for row in rows:
         grouped.setdefault((row["Framework"], row["TargetRps"]), []).append(row)
 
-    lines += ["| 框架 | 目标 RPS | 并发 | 轮数 | 成功 RPS(中位) | 达成 RPS(中位) | 错误率 | 落后 | p50 | p99 | 服务端+客户端内存(MB) |",
-              "|---|---|---|---|---|---|---|---|---|---|---|"]
+    extra = " 丢包率(中位) |" if has_loss(rows, args) else ""
+    sep_extra = "---|" if has_loss(rows, args) else ""
+    lines += [f"| 框架 | 目标 RPS | 并发 | 轮数 | 成功 RPS(中位) | 达成 RPS(中位) | 错误率 | 落后 | p50 | p99 |{extra} 服务端+客户端内存(MB) |",
+              f"|---|---|---|---|---|---|---|---|---|---|{sep_extra}---|"]
     for (framework, level) in sorted(grouped, key=lambda k: (k[0], int(k[1]))):
         group = grouped[(framework, level)]
+        loss_cell = f" {pct(median(group, 'LossRate', 2))} |" if has_loss(rows, args) else ""
         lines.append(f"| {framework} | {level} | {group[0]['Connections']} | {len(group)} | "
                      f"{median(group, 'SuccessRps')} | {median(group, 'AchievedRps')} | "
                      f"{pct(median(group, 'ErrorRate', 2))} | {pct(median(group, 'LateSend', 2))} | "
-                     f"{median(group, 'P50', 3)} | {median(group, 'P99', 3)} | "
+                     f"{median(group, 'P50', 3)} | {median(group, 'P99', 3)} |{loss_cell} "
                      f"{median(group, 'TotalMemMB')} |")
 
     states = {key: group_state(group) for key, group in grouped.items()}
@@ -172,7 +190,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", required=True)
     parser.add_argument("--mode", choices=["ladder", "compare"], default="ladder")
-    parser.add_argument("--mode-name", default="http", help="http / tcp，只用于报告标题")
+    parser.add_argument("--mode-name", default="http", help="http / tcp / udp，只用于报告标题和口径说明")
     parser.add_argument("--levels", default="")
     parser.add_argument("--connections", default="")
     parser.add_argument("--rounds", default="1")

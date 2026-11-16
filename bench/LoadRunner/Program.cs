@@ -43,9 +43,19 @@ internal static class Program
 {
     private static int Main(string[] args)
     {
-        if (args.Length > 0 && args[0] == "serve")
+        if (args.Length > 0)
         {
-            return OriginServer.Run(args);
+            switch (args[0])
+            {
+                case "serve":
+                    return OriginServer.Run(args);
+                case "serve-udp":
+                    return UdpRunner.RunEcho(args);
+                case "udpping":
+                    return UdpRunner.RunPing(args);
+                case "udpload":
+                    return UdpRunner.RunLoad(args);
+            }
         }
 
         Options options;

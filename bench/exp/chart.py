@@ -83,9 +83,12 @@ def draw(csv_path, out_path, mode, levels):
     f_title, f_lbl, f_val, f_note = load_font(24, True), load_font(13), load_font(12, True), load_font(12)
 
     conns_note = read_connections(csv_path)
-    metric_note = "达成 RPS（旧口径，含非 200）" if legacy else "成功 RPS（只数 200 响应）"
+    is_udp = mode.lower() == "udp"
+    rate_unit = "PPS" if is_udp else "RPS"
+    metric_note = ("成功 PPS（只数有效 echo）" if is_udp else "成功 RPS（只数 200 响应）") if not legacy \
+        else "达成 RPS（旧口径，含非 200）"
     d.text((40, 24), f"FastTunnel vs frp · {mode.upper()} 模式", font=f_title, fill=FG)
-    d.text((40, 58), f"目标档位 {levels} RPS  ·  {conns_note}  ·  每档先预热再测量", font=f_note, fill=GRAY)
+    d.text((40, 58), f"目标档位 {levels} {rate_unit}  ·  {conns_note}  ·  每档先预热再测量", font=f_note, fill=GRAY)
 
     left, right = 90, width - 40
     targets = sorted({t for rows in series.values() for (t, _, _) in rows})
@@ -94,6 +97,8 @@ def draw(csv_path, out_path, mode, levels):
     # ---- 上：柱状 ----
     top, bottom = 105, 360
     d.text((40, 80), f"吞吐：{metric_note} → 柱越高越好（† = 这一档没压满，延迟数字偏乐观）", font=f_lbl, fill=FG)
+    if is_udp:
+        d.text((40, height - 54), "UDP 口径：错误率 ≈ 丢包率，延迟 = 逐包 RTT；明细见 report-udp.md 的丢包率列", font=f_note, fill=GRAY)
     for frac in range(0, 5):
         y = bottom - (bottom - top) * frac / 4
         d.line([(left, y), (right, y)], fill=LIGHT)

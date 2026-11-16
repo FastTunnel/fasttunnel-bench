@@ -1,18 +1,26 @@
-﻿# 对照压测：http 模式与 tcp 模式各一版，双方代理方式一致；每档先预热再测
+﻿# 对照压测：http / tcp / udp 三种模式，双方代理方式一致；每档先预热再测
+# 手动触发默认 all（三模式全跑）；定时触发每周自动跑一遍，兜底值同为 all
 name: bench
 
 on:
+  # 每周日 03:00 UTC（北京时间周一 11:00）自动跑三模式对照。
+  # schedule 触发时 inputs 为空，下面所有 || 'all' 兜底保证 UDP 也会跑。
+  schedule:
+    - cron: '0 3 * * 0'
   workflow_dispatch:
     inputs:
       ft_release:
         description: 'FastTunnel Release tag（用官方发布包测试）'
         default: 'v3.4.0'
       mode:
-        description: '跑哪些模式（http / tcp / both）'
-        default: 'both'
+        description: '跑哪些模式（all=三种都跑，默认 / http / tcp / udp / both=仅 http+tcp）'
+        default: 'all'
       levels:
-        description: 'RPS 阶梯'
+        description: 'HTTP/TCP 的 RPS 阶梯'
         default: '5000,10000,20000,30000,40000,50000'
+      udp_levels:
+        description: 'UDP 的 PPS 阶梯（UDP 与 HTTP/TCP 独立，避免高档位压不满）'
+        default: '1000,3000,5000,10000,20000'
       connections:
         description: '并发连接数（auto-connections=0 时才固定生效）'
         default: '128'
@@ -71,7 +79,7 @@ jobs:
           bash -n bench/exp/bench.sh && echo "bench.sh 语法通过"
 
       - name: HTTP 对照（FastTunnel Web vs frp type=http）
-        if: ${{ github.event.inputs.mode != 'tcp' }}
+        if: ${{ contains(fromJSON('["http","both","all"]'), github.event.inputs.mode || 'all') }}
         run: |
           bash bench/exp/bench.sh http \
             --levels "${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}" \
@@ -84,7 +92,7 @@ jobs:
             --ft-release "${{ github.event.inputs.ft_release || 'v3.4.0' }}"
 
       - name: TCP 对照（FastTunnel Forwards vs frp type=tcp）
-        if: ${{ github.event.inputs.mode != 'http' }}
+        if: ${{ contains(fromJSON('["tcp","both","all"]'), github.event.inputs.mode || 'all') }}
         continue-on-error: true
         run: |
           bash bench/exp/bench.sh tcp \
@@ -97,17 +105,35 @@ jobs:
             --prewarm "${{ github.event.inputs.prewarm || '10' }}" \
             --ft-release "${{ github.event.inputs.ft_release || 'v3.4.0' }}"
 
+      - name: UDP 对照（FastTunnel Forwards UDP vs frp type=udp）
+        if: ${{ contains(fromJSON('["udp","all"]'), github.event.inputs.mode || 'all') }}
+        continue-on-error: true
+        run: |
+          bash bench/exp/bench.sh udp \
+            --levels "${{ github.event.inputs.udp_levels || '1000,3000,5000,10000,20000' }}" \
+            --connections "${{ github.event.inputs.connections || '128' }}" \
+            --auto-connections "${{ github.event.inputs.auto_connections || '1' }}" \
+            --rounds "${{ github.event.inputs.rounds || '3' }}" \
+            --frp-pool "${{ github.event.inputs.frp_pool || '0' }}" \
+            --duration "${{ github.event.inputs.duration || '10' }}" \
+            --prewarm "${{ github.event.inputs.prewarm || '10' }}" \
+            --ft-release "${{ github.event.inputs.ft_release || 'v3.4.0' }}"
+
       - name: 生成图表并提交
         if: always()
         env:
           LEVELS_INPUT: ${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}
+          UDP_LEVELS_INPUT: ${{ github.event.inputs.udp_levels || '1000,3000,5000,10000,20000' }}
         run: |
           mkdir -p results/latest
           shopt -s nullglob
-          for mode in http tcp; do
+          # 每次运行都是全新 checkout，out/exp 里只会有多跑过的模式留下的 CSV；
+          # 这里统一遍历三种，-f 守卫跳过没跑的模式。
+          for mode in http tcp udp; do
             csv="out/exp/results-${mode}.csv"
             if [ -f "$csv" ]; then
-              python3 bench/exp/chart.py --csv "$csv" --out "results/latest/chart-${mode}.png" --mode "$mode" --levels "$LEVELS_INPUT"
+              if [ "$mode" = "udp" ]; then levels="$UDP_LEVELS_INPUT"; else levels="$LEVELS_INPUT"; fi
+              python3 bench/exp/chart.py --csv "$csv" --out "results/latest/chart-${mode}.png" --mode "$mode" --levels "$levels"
               cp "$csv" "results/latest/results-${mode}.csv"
             fi
           done
@@ -127,7 +153,7 @@ jobs:
           raw="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME"
           {
             echo "**Runner**：$(nproc) 核 / $(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo) GB / $(uname -srm)"
-            echo "**参数**：levels=${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}，connections=${{ github.event.inputs.connections || '128' }}，auto_connections=${{ github.event.inputs.auto_connections || '1' }}，rounds=${{ github.event.inputs.rounds || '3' }}，frp_pool=${{ github.event.inputs.frp_pool || '0' }}，duration=${{ github.event.inputs.duration || '10' }}s，prewarm=${{ github.event.inputs.prewarm || '10' }}s"
+            echo "**参数**：mode=${{ github.event.inputs.mode || 'all' }}，levels=${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}，udp_levels=${{ github.event.inputs.udp_levels || '1000,3000,5000,10000,20000' }}，connections=${{ github.event.inputs.connections || '128' }}，auto_connections=${{ github.event.inputs.auto_connections || '1' }}，rounds=${{ github.event.inputs.rounds || '3' }}，frp_pool=${{ github.event.inputs.frp_pool || '0' }}，duration=${{ github.event.inputs.duration || '10' }}s，prewarm=${{ github.event.inputs.prewarm || '10' }}s"
             echo "**运行**：[#${{ github.run_number }}]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
             echo
             echo "> 两侧同一种代理方式（http 对 http、tcp 对 tcp），健康检查通过后先预热再测量。"
@@ -135,7 +161,7 @@ jobs:
             echo "> **成功 RPS** 只数 200 响应，跨框架对比看这一列；**落后** 不为 0 时对照成功 RPS：达标只是发送被排后（吞吐可引用、p99 偏乐观），没达标就是没压上去（该档不能引用）。"
             echo "> frp 连接池：\`0\`=出厂默认（frpc poolCount=1 / frps maxPoolCount=5，本轮默认）；\`auto\`/数字=双侧一起调平，实测会让 frp 的 http 模式更差，只在显式要求时启用。"
             echo
-            for mode in http tcp; do
+            for mode in http tcp udp; do
               chart="results/latest/chart-${mode}.png"
               report="out/exp/report-${mode}.md"
               [ -f "$report" ] || continue
@@ -158,8 +184,11 @@ jobs:
               echo "</details>"
               echo
             done
-            # 失败时把隧道日志贴进 issue，方便在无 admin 权限时排障
-            if ! ls out/exp/report-http.md out/exp/report-tcp.md >/dev/null 2>&1; then
+            # 失败时把隧道日志贴进 issue，方便在无 admin 权限时排障。
+            # 注意：mode 可只跑一种，所以只在新模式下「一个报告都没生成」时才算失败，
+            # 不能用 ls a b c（那会要求三种都存在）。
+            report_count=$(ls out/exp/report-http.md out/exp/report-tcp.md out/exp/report-udp.md 2>/dev/null | wc -l)
+            if [ "$report_count" -eq 0 ]; then
               echo "## 排障信息（失败）"
               echo
               echo '```'
@@ -184,7 +213,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MODE_INPUT: ${{ github.event.inputs.mode || 'both' }}
+          MODE_INPUT: ${{ github.event.inputs.mode || 'all' }}
           LEVELS_INPUT: ${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}
         run: |
           gh label create bench-report --color 0E8A16 --description '自动压测报告' 2>/dev/null || true
@@ -202,8 +231,10 @@ jobs:
           path: |
             out/exp/report-http.md
             out/exp/report-tcp.md
+            out/exp/report-udp.md
             out/exp/results-http.csv
             out/exp/results-tcp.csv
+            out/exp/results-udp.csv
             out/exp/results/*.json
             out/exp/run/*.log
             issue-body.md
