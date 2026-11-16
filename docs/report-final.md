@@ -191,8 +191,8 @@ powershell -File bench\exp\setup-iis-admin.ps1
 # 2) HTTP 模式阶梯（两侧）
 powershell -File bench\exp\run-experiment.ps1 -LevelsCsv 5000,10000
 
-# 3) frp 双侧调平后的 HTTP 对照（现在同时写 frpc poolCount 与 frps maxPoolCount）
-#    默认 -AutoConnections 会把并发随档位放大，池不够时脚本会自动上调并打一行提示
+# 3) frp 双侧调平后的 HTTP 对照（同时写 frpc poolCount 与 frps maxPoolCount）
+#    注意这是**非出厂**配置，实测比默认更差；默认（不传 -FrpPoolCount）走 frpc 1 / frps 5
 powershell -File bench\exp\run-experiment.ps1 -Frameworks frp -LevelsCsv 5000,10000 -FrpPoolCount 256
 
 # 4) FastTunnel(Forwards) vs frp(type=tcp)，两侧同一层，含 CPU/内存，交替 3 轮
