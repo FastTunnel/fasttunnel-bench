@@ -21,6 +21,11 @@ if ($levels.Count -eq 0) { throw 'results.csv 里没有档位数据' }
 $colors = @{ 'ft' = '#2f7ed8'; 'frp' = '#d9534f' }
 $labels = @{ 'ft' = 'FastTunnel'; 'frp' = 'frp 0.72.0' }
 
+# 吞吐面板用 SuccessRps（只数 200 响应）；老 CSV 没这一列时退回 AchievedRps 并改标题。
+$HasSuccessCol = [bool]($rows[0].PSObject.Properties.Name -contains 'SuccessRps')
+$RpsField = if ($HasSuccessCol) { 'SuccessRps' } else { 'AchievedRps' }
+$RpsTitle = if ($HasSuccessCol) { '成功速率 (RPS，只数 200)' } else { '达成速率 (RPS，旧口径含非 200)' }
+
 $width = 960
 $panelHeight = 260
 $paddingLeft = 78
@@ -42,9 +47,19 @@ function Get-X([int]$index) {
     return $paddingLeft + ($width - $paddingLeft - $paddingRight) * $index / ($levels.Count - 1)
 }
 
+# 多轮 results.csv 同一档位会有多行：取中位数，与 report.md 的口径一致。
+function Get-MedianValue([string]$Framework, [int]$Level, [string]$Field) {
+    $vals = @($rows | Where-Object { $_.Framework -eq $Framework -and [int]$_.TargetRps -eq $Level } |
+        ForEach-Object { [double]$_.$Field })
+    if ($vals.Count -eq 0) { return $null }
+    $vals = $vals | Sort-Object
+    if ($vals.Count % 2) { return $vals[[int](($vals.Count - 1) / 2)] }
+    return ($vals[$vals.Count / 2 - 1] + $vals[$vals.Count / 2]) / 2
+}
+
 $panels = @(
     @{ Title = 'p99 延迟 (ms)'; Field = 'P99'; Max = $null },
-    @{ Title = '达成速率 (RPS)'; Field = 'AchievedRps'; Max = $null },
+    @{ Title = $RpsTitle; Field = $RpsField; Max = $null },
     @{ Title = '错误率 (%)'; Field = 'ErrorRate'; Max = 1 }
 )
 
@@ -55,8 +70,14 @@ foreach ($panel in $panels) {
 
     # 计算该面板的最大值
     $values = @()
-    foreach ($row in $rows) { $values += [double]$row.($panel.Field) }
-    $max = ($values | Measure-Object -Maximum).Maximum
+    foreach ($framework in $frameworks) {
+        foreach ($level in $levels) {
+            $v = Get-MedianValue $framework $level $panel.Field
+            if ($null -ne $v) { $values += $v }
+        }
+    }
+    $max = 0
+    if ($values.Count -gt 0) { $max = ($values | Measure-Object -Maximum).Maximum }
     if ($panel.Max) { $max = [math]::Max($max, [double]$panel.Max) }
     if ($max -le 0) { $max = 1 }
 
@@ -80,8 +101,8 @@ foreach ($panel in $panels) {
         Add "<text x='$x' y='$($bottom + 18)' text-anchor='middle' fill='#666'>$($levels[$i])</text>"
     }
 
-    # 每档的目标速率参考线（仅达成速率面板）
-    if ($panel.Field -eq 'AchievedRps') {
+    # 每档的目标速率参考线（仅成功/达成速率面板）
+    if ($panel.Field -eq $RpsField) {
         $points = @()
         for ($i = 0; $i -lt $levels.Count; $i++) {
             $x = Get-X $i
@@ -96,13 +117,12 @@ foreach ($panel in $panels) {
         $segments = @()
         $current = @()
         for ($i = 0; $i -lt $levels.Count; $i++) {
-            $row = $rows | Where-Object { $_.Framework -eq $framework -and [int]$_.TargetRps -eq $levels[$i] } | Select-Object -First 1
-            if (-not $row) {
+            $value = Get-MedianValue $framework $levels[$i] $panel.Field
+            if ($null -eq $value) {
                 if ($current.Count -gt 0) { $segments += ,@($current); $current = @() }
                 continue
             }
 
-            $value = [double]$row.($panel.Field)
             $x = Get-X $i
             $y = $bottom - $panelHeight * ([math]::Min(1.0, $value / $max))
             $current += "$x,$y"

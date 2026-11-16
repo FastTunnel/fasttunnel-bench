@@ -6,7 +6,10 @@
 #   tcp  : FastTunnel Forwards(TCP) vs frp type=tcp
 #
 #   ./bench.sh http --levels 5000,10000,20000 --connections 128
-#   ./bench.sh tcp  --levels 5000,10000,20000 --connections 128
+#   ./bench.sh tcp  --levels 5000,10000,20000 --connections 128 --rounds 3
+#
+# 两套隧道同时在线，按 轮次 → 档位 → 框架 交替执行（奇偶轮交换先后），
+# 这样单轮内的机器漂移会平摊到两侧，而不是"ft 全跑完再跑 frp"。
 #
 # 只依赖：bash、dotnet、curl、tar、python3（解析压测 JSON）、ss（排障）
 set -euo pipefail
@@ -17,7 +20,14 @@ CONNECTIONS="128"
 WARMUP="3"
 DURATION="10"
 PREWARM="10"
-FRP_POOL="0"
+ROUNDS="1"
+# 每条连接收完响应才发下一条，实际发压 ≈ 并发 ÷ 延迟；固定并发压不到高档位，
+# p99 会偏乐观。默认让并发随档位放大（目标 RPS / 50，上限 1024）。
+AUTO_CONNS="1"
+MAX_AUTO_CONNS="1024"
+# frp 连接池：auto = 调平到本轮最大并发（frpc poolCount + frps maxPoolCount 一起写）；
+# 0 = 出厂默认（1 / 5），只用于「想看 frp 出厂表现」的对照。
+FRP_POOL="auto"
 FRAMEWORKS="ft,frp"
 FASTTUNNEL_ROOT="${FASTTUNNEL_ROOT:-}"
 FT_RELEASE=""
@@ -46,13 +56,16 @@ while [[ $# -gt 0 ]]; do
         --warmup) WARMUP="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
         --prewarm) PREWARM="$2"; shift 2 ;;
+        --rounds) ROUNDS="$2"; shift 2 ;;
+        --auto-connections) AUTO_CONNS="$2"; shift 2 ;;
+        --max-auto-connections) MAX_AUTO_CONNS="$2"; shift 2 ;;
         --frameworks) FRAMEWORKS="$2"; shift 2 ;;
         --frp-pool) FRP_POOL="$2"; shift 2 ;;
         --log-level) LOG_LEVEL="$2"; shift 2 ;;
         --fasttunnel-root) FASTTUNNEL_ROOT="$2"; shift 2 ;;
         --ft-release) FT_RELEASE="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
         *) echo "未知参数：$1" >&2; exit 2 ;;
     esac
 done
@@ -73,6 +86,10 @@ fail() { printf '\033[31m[失败] %s\033[0m\n' "$*" >&2; }
 
 PIDS=()
 ORIGIN_PID=""
+FT_SERVER_PID=""
+FT_CLIENT_PID=""
+FRPS_PID=""
+FRPC_PID=""
 cleanup() { for pid in "${PIDS[@]:-}"; do kill -9 "${pid}" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
@@ -148,6 +165,17 @@ write_configs() {
         webs="[ { \"LocalPort\": ${ORIGIN_PORT}, \"LocalIp\": \"127.0.0.1\", \"SubDomain\": \"bench\" } ]"
     fi
 
+    # frp 的连接池开关必须写在 [[proxies]] 之前：TOML 里那会落进代理表，
+    # 而 frp 的 per-proxy transport 没有 poolCount 字段，strict 模式（默认开）直接报错退出。
+    local frpc_pool_line=""
+    local frps_maxpool_line=""
+    if [[ "${FRP_POOL}" != "0" && -n "${FRP_POOL}" ]]; then
+        frpc_pool_line="transport.poolCount = ${FRP_POOL}"
+        # frps 默认只放行 5 条 work connection（transport.maxPoolCount），
+        # 不同步放开就等于把客户端的 poolCount 夹回 5。
+        frps_maxpool_line="transport.maxPoolCount = ${FRP_POOL}"
+    fi
+
     cat > "${RUN_DIR}/ft-server/config/appsettings.json" <<JSON
 {
   "Serilog": { "MinimumLevel": { "Default": "${LOG_LEVEL}", "Override": { "Microsoft": "Warning" } }, "WriteTo": [] },
@@ -187,20 +215,25 @@ JSON
 }
 JSON
 
+    # 日志口径与 FastTunnel 侧对齐：两侧都不落盘。
+    # 之前 frp 是 log.to=console + info，每条 work connection 都要格式化+写文件，
+    # 那是把 frp 的日志开销算进了被测成本。
     cat > "${RUN_DIR}/frp/frps.toml" <<TOML
 bindPort = ${FRP_BIND_PORT}
 vhostHTTPPort = ${FRP_HTTP_PORT}
-log.to = "console"
-log.level = "info"
+log.to = "disable"
+log.level = "error"
 transport.tls.force = false
+${frps_maxpool_line}
 TOML
 
     cat > "${RUN_DIR}/frp/frpc.toml" <<TOML
 serverAddr = "127.0.0.1"
 serverPort = ${FRP_BIND_PORT}
-log.to = "console"
-log.level = "info"
+log.to = "disable"
+log.level = "error"
 transport.tls.enable = false
+${frpc_pool_line}
 TOML
 
     if [[ "${MODE}" == "tcp" ]]; then
@@ -224,10 +257,6 @@ localPort = ${ORIGIN_PORT}
 customDomains = [ "${FRP_HOST}" ]
 TOML
     fi
-
-    if [[ "${FRP_POOL}" != "0" && -n "${FRP_POOL}" ]]; then
-        echo "transport.poolCount = ${FRP_POOL}" >> "${RUN_DIR}/frp/frpc.toml"
-    fi
 }
 
 start_origin() {
@@ -240,18 +269,22 @@ start_origin() {
 
 start_ft() {
     ( cd "${RUN_DIR}/ft-server" && exec "${FT_SERVER_BIN}" >> "${RUN_DIR}/ft-server.log" 2>&1 ) &
-    PIDS+=($!)
+    FT_SERVER_PID=$!
+    PIDS+=("${FT_SERVER_PID}")
     sleep 1
     ( cd "${RUN_DIR}/ft-client" && exec "${FT_CLIENT_BIN}" >> "${RUN_DIR}/ft-client.log" 2>&1 ) &
-    PIDS+=($!)
+    FT_CLIENT_PID=$!
+    PIDS+=("${FT_CLIENT_PID}")
 }
 
 start_frp() {
     "${FRP_DIR}/frps" -c "${RUN_DIR}/frp/frps.toml" >> "${RUN_DIR}/frps.log" 2>&1 &
-    PIDS+=($!)
+    FRPS_PID=$!
+    PIDS+=("${FRPS_PID}")
     sleep 1
     "${FRP_DIR}/frpc" -c "${RUN_DIR}/frp/frpc.toml" >> "${RUN_DIR}/frpc.log" 2>&1 &
-    PIDS+=($!)
+    FRPC_PID=$!
+    PIDS+=("${FRPC_PID}")
 }
 
 # 就绪探测：失败时打印全量监听表 + 日志尾巴
@@ -268,6 +301,14 @@ wait_ready() {
     fail "${name} 未就绪：${port} 上 HTTP=${code}"
     echo '--- ss -ltnp（全量）---'
     ss -ltnp 2>/dev/null || echo '(ss 不可用)'
+    # 隧道日志已经不落盘（与 FastTunnel 侧口径对齐），配置写错时只能靠 verify 报出来
+    for bin in frps frpc; do
+        exe="${FRP_DIR}/${bin}"
+        cfg="${RUN_DIR}/frp/${bin}.toml"
+        [[ -x "${exe}" && -f "${cfg}" ]] || continue
+        echo "--- ${bin} verify ${cfg} ---"
+        "${exe}" verify -c "${cfg}" 2>&1 | tail -n 5 || true
+    done
     for f in "${RUN_DIR}"/ft-server.log "${RUN_DIR}"/ft-client.log "${RUN_DIR}"/frps.log "${RUN_DIR}"/frpc.log; do
         [[ -s "$f" ]] && { echo "--- $(basename "$f") ---"; tail -n 15 "$f"; }
     done
@@ -277,14 +318,24 @@ wait_ready() {
 proc_rss_mb() { awk '/VmRSS/{printf "%.1f", $2/1024}' "/proc/$1/status" 2>/dev/null || echo 0; }
 proc_cpu_ticks() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
 
+# 该档实际用的并发数：自适应时按目标速率放大，固定模式就返回 --connections
+conns_for() {
+    local level="$1" want
+    [[ "${AUTO_CONNS}" == "1" ]] || { echo "${CONNECTIONS}"; return; }
+    want=$(( level / 50 ))
+    (( want < 64 )) && want=64
+    (( want > MAX_AUTO_CONNS )) && want=${MAX_AUTO_CONNS}
+    echo "${want}"
+}
+
 run_once() {
-    local framework="$1" port="$2" host="$3" level="$4" server_pid="$5" client_pid="$6" tag="$7"
-    local out="${OUT}/results/${framework}-${level}-${tag}.json"
+    local framework="$1" port="$2" host="$3" level="$4" server_pid="$5" client_pid="$6" round="$7" conns="$8"
+    local out="${OUT}/results/${framework}-${level}-r${round}.json"
     local cpu0 cpu1 rss_s rss_c hz
     cpu0=$(( $(proc_cpu_ticks "${server_pid}") + $(proc_cpu_ticks "${client_pid}") ))
 
     "${RUNNER}" --connect "127.0.0.1:${port}" --host "${host}" --path "${PAGE_PATH}" \
-        --rps "${level}" --connections "${CONNECTIONS}" \
+        --rps "${level}" --connections "${conns}" \
         --warmup "${WARMUP}" --duration "${DURATION}" \
         --out "${out}" --label "${framework}-${level}" >/dev/null
 
@@ -293,19 +344,24 @@ run_once() {
     rss_c=$(proc_rss_mb "${client_pid}")
     hz=$(getconf CLK_TCK)
 
-    python3 - "${out}" "${framework}" "${level}" "${CONNECTIONS}" "$((cpu1-cpu0))" "${hz}" "${rss_s}" "${rss_c}" "${WARMUP}" <<'PY'
+    python3 - "${out}" "${framework}" "${level}" "${conns}" "${round}" "$((cpu1-cpu0))" "${hz}" "${rss_s}" "${rss_c}" "${WARMUP}" <<'PY'
 import json, sys
-path, fw, level, conns, ticks, hz, rss_s, rss_c, warmup = sys.argv[1:10]
+path, fw, level, conns, rnd, ticks, hz, rss_s, rss_c, warmup = sys.argv[1:11]
 d = json.load(open(path))
 dur = max(0.001, float(d.get("DurationSeconds", 0)) + float(warmup))
 print(",".join([
-    fw, level, conns,
+    fw, level, conns, rnd,
+    # 成功 RPS 只数 200，跨框架对比看这一列；达成 RPS 含隧道自己返回的非 200
+    f'{d.get("SuccessRps", 0):.1f}',
     f'{d.get("AchievedRps", 0):.1f}',
     f'{d.get("ErrorRate", 0) * 100:.2f}',
+    f'{d.get("LateSendRatio", 0) * 100:.2f}',
+    str(d.get("ConnectFailures", 0)),
     f'{d.get("LatencyMs", {}).get("P50", 0):.3f}',
     f'{d.get("LatencyMs", {}).get("P99", 0):.3f}',
     f'{d.get("LatencyMs", {}).get("P999", 0):.3f}',
-    f'{d.get("MiBps", 0):.3f}',
+    # 键名是 ThroughputMiBps：之前写成 MiBps，这一列恒为 0
+    f'{d.get("ThroughputMiBps", 0):.3f}',
     f'{int(ticks) / int(hz) / dur:.2f}',
     rss_s, rss_c, f'{float(rss_s) + float(rss_c):.1f}',
 ]))
@@ -313,68 +369,87 @@ PY
 }
 
 prewarm() {
-    local framework="$1" port="$2" host="$3" server_pid="$4" client_pid="$5"
+    local framework="$1" port="$2" host="$3" server_pid="$4" client_pid="$5" conns="$6"
     [[ "${PREWARM}" == "0" ]] && return 0
     local burst="${first_level}"
     (( burst > 2000 )) && burst=2000
     log "预热 ${framework}：${burst} RPS × ${PREWARM}s（JIT/连接池/GC 先跑热）"
     "${RUNNER}" --connect "127.0.0.1:${port}" --host "${host}" --path "${PAGE_PATH}" \
-        --rps "${burst}" --connections "${CONNECTIONS}" \
+        --rps "${burst}" --connections "${conns}" \
         --warmup 1 --duration "${PREWARM}" \
         --out "${OUT}/results/${framework}-prewarm.json" --label "${framework}-prewarm" >/dev/null || true
 }
 
 prepare
+
+# 本轮会用到的最大并发：frp 的池必须至少覆盖它。HTTP/TCP 代理都是「一条用户连接吃一条
+# work connection」，池小一点就多出来的连接每请求现建一条，测到的不是 frp 的正常表现
+# （和只调客户端、被服务端 maxPoolCount 夹回 5 是同一类不公平）。
+pool_need=${CONNECTIONS}
+for level in ${LEVELS//,/ }; do
+    want=$(conns_for "${level}")
+    (( want > pool_need )) && pool_need=${want}
+done
+if [[ "${FRP_POOL}" == "auto" ]]; then
+    FRP_POOL=${pool_need}
+    log "frp 连接池自动双侧调平到本轮最大并发 ${FRP_POOL}"
+elif [[ -n "${FRP_POOL}" && "${FRP_POOL}" != "0" ]] && (( FRP_POOL < pool_need )); then
+    log "frp 连接池 ${FRP_POOL} 小于本轮最大并发 ${pool_need}，已上调；要用出厂默认请传 --frp-pool 0"
+    FRP_POOL=${pool_need}
+fi
+
 write_configs
 start_origin
 
+# 两套隧道同时在线：交替测的时候不能被"谁刚启动"影响
+start_ft
+start_frp
+
+if [[ "${MODE}" == "tcp" ]]; then
+    ft_entry_port="${FT_FWD_PORT}"
+    frp_entry_port="${FRP_TCP_PORT}"
+else
+    ft_entry_port="${FT_BIN_PORT}"
+    frp_entry_port="${FRP_HTTP_PORT}"
+fi
+
+# 裸 TCP 转发不做虚拟主机路由，两侧都发同一个 Host 头，保证请求字节一致
+frp_entry_host="${FRP_HOST}"
+[[ "${MODE}" == "tcp" ]] && frp_entry_host="${FT_HOST}"
+
+wait_ready "${ft_entry_port}" "${FT_HOST}" "FastTunnel(${MODE})" || exit 1
+wait_ready "${frp_entry_port}" "${frp_entry_host}" "frp(${MODE})" || exit 1
+
 CSV="${OUT}/results-${MODE}.csv"
-echo 'Framework,TargetRps,Connections,AchievedRps,ErrorRate,P50,P99,P999,MiBps,TotalCores,ServerMemMB,ClientMemMB,TotalMemMB' > "${CSV}"
+echo 'Framework,TargetRps,Connections,Round,SuccessRps,AchievedRps,ErrorRate,LateSend,ConnectFails,P50,P99,P999,MiBps,TotalCores,ServerMemMB,ClientMemMB,TotalMemMB' > "${CSV}"
 
 first_level="${LEVELS%%,*}"
+prewarm ft "${ft_entry_port}" "${FT_HOST}" "${FT_SERVER_PID}" "${FT_CLIENT_PID}" "$(conns_for "${first_level}")"
+prewarm frp "${frp_entry_port}" "${frp_entry_host}" "${FRPS_PID}" "${FRPC_PID}" "$(conns_for "${first_level}")"
 
-for fw in ${FRAMEWORKS//,/ }; do
-    if [[ "${fw}" == "ft" ]]; then
-        start_ft
-        if [[ "${MODE}" == "tcp" ]]; then
-            entry_port="${FT_FWD_PORT}"
-        else
-            entry_port="${FT_BIN_PORT}"
-        fi
-        wait_ready "${entry_port}" "${FT_HOST}" "FastTunnel(${MODE})" || exit 1
-        server_pid=${PIDS[-2]}; client_pid=${PIDS[-1]}
-        entry_host="${FT_HOST}"
-    else
-        start_frp
-        if [[ "${MODE}" == "tcp" ]]; then
-            entry_port="${FRP_TCP_PORT}"
-        else
-            entry_port="${FRP_HTTP_PORT}"
-        fi
-        wait_ready "${entry_port}" "${FRP_HOST}" "frp(${MODE})" || exit 1
-        server_pid=${PIDS[-2]}; client_pid=${PIDS[-1]}
-        entry_host="${FRP_HOST}"
-        [[ "${MODE}" == "tcp" ]] && entry_host="${FT_HOST}"
-    fi
-
-    prewarm "${fw}" "${entry_port}" "${entry_host}" "${server_pid}" "${client_pid}"
+for (( round = 1; round <= ROUNDS; round++ )); do
+    # 奇偶轮交换先后，抵消"谁先跑谁吃亏"的偏置
+    if (( round % 2 == 1 )); then order=(ft frp); else order=(frp ft); fi
 
     for level in ${LEVELS//,/ }; do
-        line=$(run_once "${fw}" "${entry_port}" "${entry_host}" "${level}" "${server_pid}" "${client_pid}" "run")
-        echo "${line}" | tee -a "${CSV}"
-        echo "${line}" >> "${OUT}/results/${fw}-${level}.csv"
+        conns=$(conns_for "${level}")
+        for fw in "${order[@]}"; do
+            if [[ "${fw}" == "ft" ]]; then
+                line=$(run_once ft "${ft_entry_port}" "${FT_HOST}" "${level}" "${FT_SERVER_PID}" "${FT_CLIENT_PID}" "${round}" "${conns}")
+            else
+                line=$(run_once frp "${frp_entry_port}" "${frp_entry_host}" "${level}" "${FRPS_PID}" "${FRPC_PID}" "${round}" "${conns}")
+            fi
+            echo "${line}" | tee -a "${CSV}"
+        done
     done
-
-    for pid in "${PIDS[@]}"; do
-        [[ "${pid}" == "${ORIGIN_PID}" ]] && continue
-        kill -9 "${pid}" 2>/dev/null || true
-    done
-    PIDS=("${ORIGIN_PID}")
-    sleep 1
 done
 
-python3 "${BENCH_ROOT}/bench/exp/report.py" --csv "${CSV}" --mode ladder \
-        --levels "${LEVELS}" --connections "${CONNECTIONS}" --out "${OUT}" \
-        --report "${OUT}/report-${MODE}.md"
+report_mode="ladder"
+(( ROUNDS > 1 )) && report_mode="compare"
 
-log "完成：${MODE} 模式，结果在 ${OUT}"
+python3 "${BENCH_ROOT}/bench/exp/report.py" --csv "${CSV}" --mode "${report_mode}" \
+        --levels "${LEVELS}" --connections "${CONNECTIONS}" --rounds "${ROUNDS}" \
+        --auto-connections "${AUTO_CONNS}" --frp-pool "${FRP_POOL}" --mode-name "${MODE}" \
+        --out "${OUT}" --report "${OUT}/report-${MODE}.md"
+
+log "完成：${MODE} 模式，${ROUNDS} 轮，结果在 ${OUT}"

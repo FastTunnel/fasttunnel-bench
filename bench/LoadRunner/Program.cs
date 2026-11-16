@@ -30,7 +30,14 @@ namespace FastTunnel.LoadRunner;
 ///   超时交给内核（ReceiveTimeout），压测工具自身的开销不会混进被测延迟。
 /// - 全局槽位定速：每个请求领取一个「应发送时刻」，聚合速率精确等于目标 RPS；
 ///   机器扛不住时表现为「实际速率低于目标 + 落后于计划」，而不是把队列无限堆高。
-/// - 延迟从真正写出请求那一刻算起，不含排队时间——排队单独用 "LateSendRatio" 度量。
+/// - 延迟从真正写出请求那一刻算起，不含排队时间——排队单独用 LateSendRatio 度量。
+///
+/// 两条必须知道的口径边界：
+/// - 吞吐分成功与达成两个数：SuccessRps 只数 200，AchievedRps 数所有拿到响应的请求（含 502/500）。
+///   对比隧道时看 SuccessRps，否则一方把自己的错误响应也算成吞吐。
+/// - 每条连接收完响应才发下一条，所以这是「定速节奏 + 闭环执行」：实际发压 ≈ 并发数 ÷ 平均延迟。
+///   高档位如果并发不够，达成率会自己掉下来、p99 却依旧好看；要测真实上限必须把并发抬到
+///   目标速率 × 可接受延迟以上（编排脚本的 -AutoConnections），不能只加 RPS。
 /// </summary>
 internal static class Program
 {
@@ -148,7 +155,10 @@ internal static class Program
         }
 
         var latencies = new List<double>(samples.Count);
-        var errors = 0;
+        var attempts = 0;
+        var responded = 0;
+        var success = 0;
+        var scheduled = 0;
         long bytes = 0;
         var lateSends = 0;
         var windowStart = options.Warmup;
@@ -161,24 +171,37 @@ internal static class Program
             {
                 continue; // 预热期 / 收尾期的样本不计入统计
             }
+
+            attempts++;
+
+            if (sample.Scheduled)
+            {
+                scheduled++;
+                if (sample.LateByMs > 5)
+                {
+                    lateSends++;
+                }
+            }
+
+            if (!sample.Responded)
+            {
+                continue; // 没拿到响应：进错误计数，但不进延迟和吞吐
+            }
+
+            responded++;
             latencies.Add(sample.LatencyMs);
             bytes += sample.Bytes;
 
-            if (!sample.Ok)
+            if (sample.Ok)
             {
-                errors++;
-            }
-
-            if (sample.LateByMs > 5)
-            {
-                lateSends++;
+                success++;
             }
         }
 
         var sorted = latencies.ToArray();
         Array.Sort(sorted);
 
-        var total = sorted.Length;
+        var latencySamples = sorted.Length;
         return new LoadResult
         {
             Label = options.Label,
@@ -186,20 +209,25 @@ internal static class Program
             Connections = options.Connections,
             WarmupSeconds = options.Warmup,
             DurationSeconds = Math.Round(measureSeconds, 2),
-            Requests = total,
-            Errors = errors,
-            ErrorRate = total == 0 ? 1 : Math.Round((double)errors / total, 6),
-            AchievedRps = Math.Round(total / measureSeconds, 1),
+            Attempts = attempts,
+            Responses = responded,
+            Success = success,
+            Errors = attempts - success,
+            ConnectFailures = attempts - responded,
+            ErrorRate = attempts == 0 ? 1 : Math.Round((double)(attempts - success) / attempts, 6),
+            AttemptedRps = Math.Round(attempts / measureSeconds, 1),
+            AchievedRps = Math.Round(responded / measureSeconds, 1),
+            SuccessRps = Math.Round(success / measureSeconds, 1),
             ThroughputMiBps = Math.Round(bytes / 1024d / 1024d / measureSeconds, 3),
-            LateSendRatio = total == 0 ? 0 : Math.Round((double)lateSends / total, 4),
+            LateSendRatio = scheduled == 0 ? 0 : Math.Round((double)lateSends / scheduled, 4),
             LatencyMs = new LatencyStats
             {
-                Mean = total == 0 ? 0 : Math.Round(sorted.Average(), 3),
+                Mean = latencySamples == 0 ? 0 : Math.Round(sorted.Average(), 3),
                 P50 = Percentile(sorted, 0.50),
                 P90 = Percentile(sorted, 0.90),
                 P99 = Percentile(sorted, 0.99),
                 P999 = Percentile(sorted, 0.999),
-                Max = total == 0 ? 0 : Math.Round(sorted[^1], 3),
+                Max = latencySamples == 0 ? 0 : Math.Round(sorted[^1], 3),
             },
         };
     }
@@ -263,16 +291,25 @@ internal static class Program
 
     private readonly struct Sample
     {
-        public Sample(bool ok, double latencyMs, int bytes, double lateByMs, double atSeconds)
+        public Sample(bool ok, bool responded, bool scheduled, double latencyMs, int bytes, double lateByMs, double atSeconds)
         {
             Ok = ok;
+            Responded = responded;
+            Scheduled = scheduled;
             LatencyMs = latencyMs;
             Bytes = bytes;
             LateByMs = lateByMs;
             AtSeconds = atSeconds;
         }
 
+        /// <summary>拿到 200 响应。</summary>
         public bool Ok { get; }
+
+        /// <summary>解析到了完整响应头（可能是 500/502）；false 表示连响应都没有。</summary>
+        public bool Responded { get; }
+
+        /// <summary>这条请求占用了定速槽位；建连失败重试不占，否则恢复瞬间会突发一轮。</summary>
+        public bool Scheduled { get; }
 
         public double LatencyMs { get; }
 
@@ -288,6 +325,9 @@ internal static class Program
 
     private sealed class Worker
     {
+        /// <summary>建连失败后的重试间隔：既不让死隧道把 CPU 烧光，也把失败样本数量限制住。</summary>
+        public const int ConnectRetryDelayMs = 50;
+
         private readonly int _id;
         private readonly Options _options;
         private readonly byte[] _request;
@@ -330,7 +370,12 @@ internal static class Program
                 {
                     if (!EnsureConnected())
                     {
-                        Thread.Sleep(50);
+                        // 建连失败也记一次尝试：否则隧道拒连只表现为"达成率变低"，错误率里完全看不见。
+                        // 但不领取定速槽位——故障期间把槽位烧光会让隧道恢复后按"全部落后"猛发一轮，
+                        // 那批延迟不属于被测链路。重试节奏由 ConnectRetryDelayMs 兜住。
+                        var now = Stopwatch.GetTimestamp();
+                        Record(new Sample(false, false, false, 0, 0, 0, AtSeconds(now)));
+                        Thread.Sleep(ConnectRetryDelayMs);
                         continue;
                     }
 
@@ -345,13 +390,20 @@ internal static class Program
                     var lateBy = (Stopwatch.GetTimestamp() - due) * 1000.0 / Stopwatch.Frequency;
                     var start = Stopwatch.GetTimestamp();
 
+                    // 只有拿到完整响应头才算"有响应"：它的耗时进延迟分位。
+                    // 拒连、超时、半路断开都只进错误计数——把 10s 超时装进 p99 会混淆两种故障。
+                    var responded = false;
+
                     try
                     {
                         SendAll(_request);
-                        var response = ReadResponse();
+                        var reader = new SocketReader(_socket!, _readBuffer);
+                        var header = reader.ReadHeaderBlock();
+                        responded = true;
+                        var response = ReadResponseBody(reader, header);
 
                         var latency = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
-                        Record(new Sample(response.Ok, latency, response.BodyBytes, lateBy, AtSeconds(start)));
+                        Record(new Sample(response.Ok, true, true, latency, response.BodyBytes, lateBy, AtSeconds(start)));
 
                         if (response.Close)
                         {
@@ -361,7 +413,7 @@ internal static class Program
                     catch (Exception)
                     {
                         var latency = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
-                        Record(new Sample(false, latency, 0, lateBy, AtSeconds(start)));
+                        Record(new Sample(false, responded, true, latency, 0, lateBy, AtSeconds(start)));
                         DropSocket();
                     }
                 }
@@ -422,11 +474,9 @@ internal static class Program
             }
         }
 
-        private Response ReadResponse()
+        /// <summary>响应头之后的部分：状态码、正文长度、是否要求关连接。调用方已确认拿到完整响应头。</summary>
+        private static Response ReadResponseBody(SocketReader reader, string header)
         {
-            var reader = new SocketReader(_socket!, _readBuffer);
-            var header = reader.ReadHeaderBlock();
-
             var status = ParseStatus(header);
             var close = header.Contains("Connection: close", StringComparison.OrdinalIgnoreCase);
 
@@ -744,13 +794,30 @@ internal static class Program
 
         public double DurationSeconds { get; set; }
 
-        public int Requests { get; set; }
+        /// <summary>测量窗口内的请求尝试数，含建连失败。</summary>
+        public int Attempts { get; set; }
+
+        /// <summary>拿到响应头的请求数（状态码可能是非 200）。</summary>
+        public int Responses { get; set; }
+
+        /// <summary>200 响应数：吞吐量的唯一可比口径。</summary>
+        public int Success { get; set; }
 
         public int Errors { get; set; }
 
+        /// <summary>连响应头都没拿到的请求数（拒连、半路断开、超时）。</summary>
+        public int ConnectFailures { get; set; }
+
         public double ErrorRate { get; set; }
 
+        /// <summary>尝试速率：含建连失败的重试，用来看发压机是否按计划在发。</summary>
+        public double AttemptedRps { get; set; }
+
+        /// <summary>达成速率：隧道实际返回了响应的请求数 / 窗口，含非 200。</summary>
         public double AchievedRps { get; set; }
+
+        /// <summary>成功速率：200 响应数 / 窗口。跨框架对比看这一列。</summary>
+        public double SuccessRps { get; set; }
 
         public double ThroughputMiBps { get; set; }
 

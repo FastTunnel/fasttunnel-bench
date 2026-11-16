@@ -14,8 +14,17 @@ on:
         description: 'RPS 阶梯'
         default: '5000,10000,20000,30000,40000,50000'
       connections:
-        description: '并发连接数'
+        description: '并发连接数（auto-connections=0 时才固定生效）'
         default: '128'
+      auto_connections:
+        description: '并发随档位放大（1=开，0=固定用上面的并发数）'
+        default: '1'
+      rounds:
+        description: '轮数（奇偶轮交换两侧先后，取中位数）'
+        default: '3'
+      frp_pool:
+        description: 'frp 双侧连接池：auto=调平到本轮最大并发，0=出厂默认（poolCount 1 / maxPoolCount 5）'
+        default: 'auto'
       duration:
         description: '每档测量秒数'
         default: '10'
@@ -67,6 +76,9 @@ jobs:
           bash bench/exp/bench.sh http \
             --levels "${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}" \
             --connections "${{ github.event.inputs.connections || '128' }}" \
+            --auto-connections "${{ github.event.inputs.auto_connections || '1' }}" \
+            --rounds "${{ github.event.inputs.rounds || '3' }}" \
+            --frp-pool "${{ github.event.inputs.frp_pool || 'auto' }}" \
             --duration "${{ github.event.inputs.duration || '10' }}" \
             --prewarm "${{ github.event.inputs.prewarm || '10' }}" \
             --ft-release "${{ github.event.inputs.ft_release || 'v3.4.0' }}"
@@ -78,6 +90,9 @@ jobs:
           bash bench/exp/bench.sh tcp \
             --levels "${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}" \
             --connections "${{ github.event.inputs.connections || '128' }}" \
+            --auto-connections "${{ github.event.inputs.auto_connections || '1' }}" \
+            --rounds "${{ github.event.inputs.rounds || '3' }}" \
+            --frp-pool "${{ github.event.inputs.frp_pool || 'auto' }}" \
             --duration "${{ github.event.inputs.duration || '10' }}" \
             --prewarm "${{ github.event.inputs.prewarm || '10' }}" \
             --ft-release "${{ github.event.inputs.ft_release || 'v3.4.0' }}"
@@ -112,11 +127,12 @@ jobs:
           raw="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME"
           {
             echo "**Runner**：$(nproc) 核 / $(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo) GB / $(uname -srm)"
-            echo "**参数**：levels=${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}，connections=${{ github.event.inputs.connections || '128' }}，duration=${{ github.event.inputs.duration || '10' }}s，prewarm=${{ github.event.inputs.prewarm || '10' }}s"
+            echo "**参数**：levels=${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}，connections=${{ github.event.inputs.connections || '128' }}，auto_connections=${{ github.event.inputs.auto_connections || '1' }}，rounds=${{ github.event.inputs.rounds || '3' }}，frp_pool=${{ github.event.inputs.frp_pool || 'auto' }}，duration=${{ github.event.inputs.duration || '10' }}s，prewarm=${{ github.event.inputs.prewarm || '10' }}s"
             echo "**运行**：[#${{ github.run_number }}]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
             echo
             echo "> 两侧同一种代理方式（http 对 http、tcp 对 tcp），健康检查通过后先预热再测量。"
             echo "> runner 为共享 vCPU，绝对数值仅作趋势参考。"
+            echo "> **成功 RPS** 只数 200 响应，跨框架对比看这一列；**落后** 不为 0 说明发压没按计划发出，该档 p99 偏乐观。"
             echo
             for mode in http tcp; do
               chart="results/latest/chart-${mode}.png"

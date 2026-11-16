@@ -3,12 +3,14 @@
 # 源站：默认读 bench\out\exp\env.json（由 setup-iis-admin.ps1 生成，指向 IIS:8080）；
 #       没有 env.json 时自动拉起内置静态源站（127.0.0.1:18080）用于验证链路。
 # 被测：FastTunnel（mux 数据面）与 frp v0.72.0（http 类型），两侧都关闭 TLS、日志降到指定级别。
-# 压测：自家 FastTunnel.LoadRunner，开环定速，每级 record 延迟分位/错误率/达成速率。
+# 压测：自家 FastTunnel.LoadRunner，定速档位，每级记录 成功/达成 RPS、错误率、落后比例、延迟分位。
 #
 # 用法：
 #   powershell -File bench\exp\run-experiment.ps1
 #   powershell -File bench\exp\run-experiment.ps1 -LevelsCsv 5000,10000,15000 -Duration 15
 #   powershell -File bench\exp\run-experiment.ps1 -Frameworks ft -LogLevel Debug   # 排查链路
+#   powershell -File bench\exp\run-experiment.ps1 -Frameworks frp -FrpPoolCount 256  # frp 双侧调平
+#   powershell -File bench\exp\run-experiment.ps1 -AutoConnections:$false -Connections 256  # 固定并发
 #
 # 产物：bench\out\exp\results\*.json、results.csv、report.md
 
@@ -18,15 +20,20 @@ param(
     [string]$OriginPath = '',
     [string]$LevelsCsv = '5000,10000,15000,20000,25000,30000',
     [int]$Connections = 256,
-    [switch]$AutoConnections,
+    # 默认开启：连接数随档位放大。关掉它就退回固定 -Connections。
+    # 为什么默认开：每条连接收完响应才发下一条，实际发压 ≈ 并发 ÷ 延迟。
+    # 固定并发下高档位会"自己压不满"，p99 好看只是因为没发出去的那部分不进样本。
+    [switch]$AutoConnections = $true,
+    [int]$MaxAutoConnections = 1024,
     [double]$Warmup = 3,
     [double]$Duration = 9,
     [string[]]$Frameworks = @('ft', 'frp'),
     [double]$MaxErrorRate = 0.20,
     [ValidateSet('Fatal', 'Error', 'Warning', 'Information', 'Debug')]
     [string]$LogLevel = 'Fatal',
-    # frp 的预建 work connection 数量（默认 5）。0 = 不写，用 frp 默认值。
-    # 用于最终报告的"frp 调平"对照组：高并发下让 frpc 提前备好连接，避免请求时现拨。
+    # frp 的预建 work connection 数量（frpc 的 transport.poolCount）。0 = 不写，用 frp 默认值（1）。
+    # 同时写 frps 的 transport.maxPoolCount：frps 默认只放行 5 条，
+    # 只调客户端会被服务端夹回 5，"调平"等于没调（frp 源码 server/control.go 取 min）。
     [int]$FrpPoolCount = 0,
     # FastTunnel 源码仓库路径；不传则读环境变量 FASTTUNNEL_ROOT，再退回"与基准仓库同级"的 ./FastTunnel
     [string]$FastTunnelRoot = '',
@@ -40,6 +47,20 @@ $ErrorActionPreference = 'Stop'
 # -LevelsCsv 用逗号分隔字符串传：PowerShell 的 -File 模式会把 "5000,10000" 当成带千位分隔符的数字
 $Levels = @($LevelsCsv -split '[,\s;]+' | Where-Object { $_ } | ForEach-Object { [int]$_ })
 if ($Levels.Count -eq 0) { throw '-LevelsCsv 为空' }
+
+# 池要跟着最大并发走：HTTP 代理每条用户连接要一条 work connection，池小于并发时多出来的连接
+# 每请求现建一条，测到的就不是 frp 的正常表现（和「只调客户端被服务端夹回 5」是同一类不公平）。
+$frpPoolNote = ''
+if ($FrpPoolCount -gt 0) {
+    $maxLevelConns = if ($AutoConnections) {
+        [int](($Levels | ForEach-Object { [math]::Min($MaxAutoConnections, [math]::Max(64, [int]($_ / 50))) }) | Measure-Object -Maximum).Maximum
+    } else { $Connections }
+    if ($FrpPoolCount -lt $maxLevelConns) {
+        $frpPoolNote = "（已按本轮最大并发 $maxLevelConns 上调）"
+        Write-Host "==> frp 连接池 $FrpPoolCount 小于本轮最大并发 $maxLevelConns，已自动上调避免把 frp 测残" -ForegroundColor Yellow
+        $FrpPoolCount = $maxLevelConns
+    }
+}
 
 $expDir = $PSScriptRoot
 $benchRoot = Split-Path (Split-Path $expDir -Parent) -Parent   # 本仓库根目录
@@ -210,6 +231,9 @@ function New-FrpConfigs {
 
     $frpPoolLine = if ($FrpPoolCount -gt 0) { "transport.poolCount = $FrpPoolCount" } else { '' }
 
+    # frps 侧必须同步放开上限：默认 maxPoolCount=5 会把客户端的 poolCount 夹到 5
+    $frpsMaxPoolLine = if ($FrpPoolCount -gt 0) { "transport.maxPoolCount = $FrpPoolCount" } else { '' }
+
     $frps = @"
 bindPort = $frpBindPort
 vhostHTTPPort = $frpHttpPort
@@ -218,6 +242,7 @@ log.to = "disable"
 log.level = "error"
 
 transport.tls.force = false
+$frpsMaxPoolLine
 "@
 
     $frpc = @"
@@ -334,11 +359,16 @@ function Run-Level {
             Label           = "$Framework-$Rps"
             TargetRps       = $Rps
             AchievedRps     = 0
+            SuccessRps      = 0
+            AttemptedRps    = 0
             ErrorRate       = 1
             LateSendRatio   = 1
             ThroughputMiBps = 0
-            Requests        = 0
+            Attempts        = 0
+            Responses       = 0
+            Success         = 0
             Errors          = 0
+            ConnectFailures = 0
             LatencyMs       = [pscustomobject]@{ Mean = 0; P50 = 0; P90 = 0; P99 = 0; P999 = 0; Max = 0 }
             ServerCores     = $null
             ClientCores     = $null
@@ -462,7 +492,8 @@ try {
             foreach ($level in $Levels) {
                 # -AutoConnections：连接数随档位放大，让"单连接节奏"远大于服务时间，
                 # 这样测到的延迟才是"按目标速率发压时的用户延迟"，而不是排队等槽位的时间。
-                $conns = if ($AutoConnections) { [math]::Min(1024, [math]::Max(64, [int]($level / 50))) } else { $Connections }
+                # 默认开启；用 -AutoConnections:$false 回到固定 -Connections。
+                $conns = if ($AutoConnections) { [math]::Min($MaxAutoConnections, [math]::Max(64, [int]($level / 50))) } else { $Connections }
 
                 Write-Host ("    --- {0} 目标 {1} RPS / 连接数 {2} ---" -f $framework, $level, $conns)
                 $result = Run-Level -Framework $framework -Rps $level -Port $entryPort -HostHeader $entryHost `
@@ -472,9 +503,11 @@ try {
                     Framework   = $framework
                     TargetRps   = $result.TargetRps
                     Connections = $result.Connections
+                    SuccessRps  = $result.SuccessRps
                     AchievedRps = $result.AchievedRps
-                    ErrorRate   = $result.ErrorRate
-                    LateSend    = $result.LateSendRatio
+                    # 与 bench.sh / report.py 一致：CSV 里的错误率、落后比例都用百分数（不是 0~1）
+                    ErrorRate   = [math]::Round($result.ErrorRate * 100, 4)
+                    LateSend    = [math]::Round($result.LateSendRatio * 100, 4)
                     P50         = $result.LatencyMs.P50
                     P90         = $result.LatencyMs.P90
                     P99         = $result.LatencyMs.P99
@@ -487,12 +520,16 @@ try {
                     ServerMem   = $result.ServerMemMB
                     ClientMem   = $result.ClientMemMB
                     TotalMem    = $result.TotalMemMB
-                    Requests    = $result.Requests
+                    Attempts    = $result.Attempts
+                    Responses   = $result.Responses
+                    Success     = $result.Success
                     Errors      = $result.Errors
+                    ConnectFails= $result.ConnectFailures
                 }
 
-                Write-Ok ("达成 {0} RPS / 错误率 {1:P2} / p50 {2}ms / p99 {3}ms / p99.9 {4}ms" -f `
-                    $result.AchievedRps, $result.ErrorRate, $result.LatencyMs.P50, $result.LatencyMs.P99, $result.LatencyMs.P999)
+                Write-Ok ("成功 {0} RPS / 达成 {1} RPS / 错误率 {2:P2} / 落后 {3:P1} / p50 {4}ms / p99 {5}ms / p99.9 {6}ms" -f `
+                    $result.SuccessRps, $result.AchievedRps, $result.ErrorRate, $result.LateSendRatio,
+                    $result.LatencyMs.P50, $result.LatencyMs.P99, $result.LatencyMs.P999)
 
                 if ($result.ErrorRate -gt $MaxErrorRate) {
                     Write-Host ("    [中止] 错误率 {0:P1} 超过阈值 {1:P0}，该框架不再往上加压" -f $result.ErrorRate, $MaxErrorRate) -ForegroundColor Yellow
@@ -523,37 +560,67 @@ $lines += '# FastTunnel vs frp v0.72.0 本地 HTTP 穿透对照压测'
 $lines += ''
 $lines += "- 时间：$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
 $lines += "- 源站：http://${OriginHost}:$OriginPort$OriginPath"
-$lines += "- 压测：开环定速 $($Levels -join ' / ') RPS，连接数 $Connections，预热 ${Warmup}s，测量 ${Duration}s"
+
+$modeDesc = if ($AutoConnections) { "随档位自适应（64~$MaxAutoConnections，目标 RPS / 50）" } else { "固定 $Connections" }
+$lines += "- 压测：定速档位 $($Levels -join ' / ') RPS，连接数 $modeDesc，预热 ${Warmup}s，测量 ${Duration}s"
 $lines += '- 两个框架均为明文：fasttunnel 用 ws 控制通道 + 明文 mux；frp 设 transport.tls.enable=false'
+if ($FrpPoolCount -gt 0) {
+    $lines += "- frp 连接池已双侧调平：frpc transport.poolCount = $FrpPoolCount，frps transport.maxPoolCount = $FrpPoolCount$frpPoolNote"
+} else {
+    $lines += '- frp 连接池为默认值（frpc poolCount=1，frps maxPoolCount=5）；如需调平请加 -FrpPoolCount'
+}
 $lines += ''
 $lines += '![对比图](chart.svg)'
 $lines += "- 日志：两侧都降到 $LogLevel（frp 为 log.level=error / log.to=disable）"
 $lines += ''
-$lines += '| 框架 | 目标 RPS | 连接数 | 达成 RPS | 错误率 | p50(ms) | p90(ms) | p99(ms) | p99.9(ms) | 最大(ms) | MiB/s | 服务端核 | 客户端核 | 压测机核 | 服务端内存(MB) | 客户端内存(MB) |'
-$lines += '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
+$lines += '> 口径：**成功 RPS** 只数 200 响应，跨框架对比看这一列；**达成 RPS** 含隧道自己返回的非 200；'
+$lines += '> **落后** 是发送时刻晚于计划 5ms 以上的请求占比，落后高说明这一档没真正压上去，此时 p99 偏低不可当结论。'
+$lines += ''
+$lines += '| 框架 | 目标 RPS | 连接数 | 成功 RPS | 达成 RPS | 错误率 | 落后 | p50(ms) | p90(ms) | p99(ms) | p99.9(ms) | 最大(ms) | MiB/s | 服务端核 | 客户端核 | 压测机核 | 服务端内存(MB) | 客户端内存(MB) |'
+$lines += '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
 foreach ($row in $all) {
-    $lines += ("| {0} | {1} | {2} | {3} | {4:P2} | {5} | {6} | {7} | {8} | {9} | {10} | {11} | {12} | {13} | {14} | {15} |" -f `
-        $row.Framework, $row.TargetRps, $row.Connections, $row.AchievedRps, $row.ErrorRate, $row.P50, $row.P90, $row.P99, $row.P999, $row.Max, $row.MiBps, $row.ServerCores, $row.ClientCores, $row.LoadCores, $row.ServerMem, $row.ClientMem)
+    $lines += ("| {0} | {1} | {2} | {3} | {4} | {5}% | {6}% | {7} | {8} | {9} | {10} | {11} | {12} | {13} | {14} | {15} | {16} | {17} |" -f `
+        $row.Framework, $row.TargetRps, $row.Connections, $row.SuccessRps, $row.AchievedRps, ('{0:N2}' -f $row.ErrorRate), ('{0:N1}' -f $row.LateSend),
+        $row.P50, $row.P90, $row.P99, $row.P999, $row.Max, $row.MiBps,
+        $row.ServerCores, $row.ClientCores, $row.LoadCores, $row.ServerMem, $row.ClientMem)
 }
 
 $lines += ''
-$lines += '## 同档位对比'
+$lines += '## 同档位对比（成功 RPS 口径）'
 $lines += ''
-$lines += '| 目标 RPS | FastTunnel 达成 | frp 达成 | FastTunnel p99 | frp p99 | FastTunnel 错误率 | frp 错误率 |'
-$lines += '|---|---|---|---|---|---|---|'
+$lines += '| 目标 RPS | FastTunnel 成功 | frp 成功 | FastTunnel p99 | frp p99 | FastTunnel 错误率 | frp 错误率 | FastTunnel 落后 | frp 落后 |'
+$lines += '|---|---|---|---|---|---|---|---|---|'
 foreach ($level in $Levels) {
     $ft = $all | Where-Object { $_.Framework -eq 'ft' -and $_.TargetRps -eq $level } | Select-Object -First 1
     $frp = $all | Where-Object { $_.Framework -eq 'frp' -and $_.TargetRps -eq $level } | Select-Object -First 1
     if (-not $ft -and -not $frp) { continue }
 
-    $lines += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} |" -f `
+    $lines += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} |" -f `
         $level,
-        $(if ($ft) { $ft.AchievedRps } else { '-' }),
-        $(if ($frp) { $frp.AchievedRps } else { '-' }),
+        $(if ($ft) { $ft.SuccessRps } else { '-' }),
+        $(if ($frp) { $frp.SuccessRps } else { '-' }),
         $(if ($ft) { $ft.P99 } else { '-' }),
         $(if ($frp) { $frp.P99 } else { '-' }),
-        $(if ($ft) { '{0:P2}' -f $ft.ErrorRate } else { '-' }),
-        $(if ($frp) { '{0:P2}' -f $frp.ErrorRate } else { '-' }))
+        $(if ($ft) { '{0:N2}%' -f $ft.ErrorRate } else { '-' }),
+        $(if ($frp) { '{0:N2}%' -f $frp.ErrorRate } else { '-' }),
+        $(if ($ft) { '{0:N1}%' -f $ft.LateSend } else { '-' }),
+        $(if ($frp) { '{0:N1}%' -f $frp.LateSend } else { '-' }))
+}
+
+# 饱和判定：成功速率不到目标 95% 或落后超过 5% 的档位，说明这一档没压上去
+$saturated = @($all | Where-Object { [double]$_.SuccessRps -lt [double]$_.TargetRps * 0.95 -or [double]$_.LateSend -gt 5 })
+if ($saturated.Count -gt 0) {
+    $lines += ''
+    $lines += '## 未压满的档位（这些行的 p99 不能当结论）'
+    $lines += ''
+    $lines += '| 框架 | 目标 RPS | 连接数 | 成功 RPS | 落后 | 说明 |'
+    $lines += '|---|---|---|---|---|---|'
+    foreach ($row in $saturated) {
+        $why = if ([double]$row.LateSend -gt 5) { '发压机落后于计划，排队时间未计入延迟' } else { '实际成功速率低于目标（并发 ÷ 延迟 封顶）' }
+        $lines += ("| {0} | {1} | {2} | {3} | {4}% | {5} |" -f $row.Framework, $row.TargetRps, $row.Connections, $row.SuccessRps, ('{0:N1}' -f $row.LateSend), $why)
+    }
+    $lines += ''
+    $lines += '> 想测真实上限：加大 -MaxAutoConnections，或换更少的被测端开销；只要「落后」不为 0，这一档的延迟数字就偏乐观。'
 }
 
 $lines | Set-Content -Path $report -Encoding utf8
@@ -568,7 +635,7 @@ catch {
 
 Write-Host ''
 Write-Host '================ 结果 ================' -ForegroundColor Green
-$all | Format-Table Framework, TargetRps, AchievedRps, ErrorRate, P50, P99, P999, MiBps, ServerCores, ClientCores -AutoSize
+$all | Format-Table Framework, TargetRps, Connections, SuccessRps, AchievedRps, ErrorRate, LateSend, P50, P99, P999, MiBps, ServerCores, ClientCores -AutoSize
 Write-Host "原始数据：$resultsDir"
 Write-Host "CSV：$csv"
 Write-Host "报告：$report"
