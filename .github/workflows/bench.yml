@@ -74,6 +74,10 @@ jobs:
           dotnet-version: |
             10.0.x
             11.0.x
+          # dependent 包的 client/server runtimeconfig 同时依赖 Microsoft.AspNetCore.App 11.0.0，
+          # 只装 dotnet runtime 会以 "framework not found" 启动失败，必须显式装 ASP.NET Core runtime。
+          aspnetcore-version: |
+            11.0.x
 
       - name: 安装绘图依赖与中文字体
         run: |

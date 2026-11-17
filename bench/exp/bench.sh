@@ -35,11 +35,13 @@ FRAMEWORKS="ft,frp"
 FASTTUNNEL_ROOT="${FASTTUNNEL_ROOT:-}"
 FT_RELEASE=""
 # ft 构建变体：auto（按 tag 推断）/ aot（native AOT）/ dependent（依赖 .NET runtime）/ legacy（旧版 zip）。
-# 3.6.0+ 官方包拆分：FastTunnel-aot-linux-x64.tar.gz / FastTunnel-dependent-linux-x64.tar.gz；
+# 3.6.0+ 官方包拆分：FastTunnel-aot-linux-x64.tar.gz / FastTunnel-dependent-any.tar.gz（跨架构通用）；
 # 3.6.0 之前只有一个 FastTunnel-linux-x64.zip。auto 按 tag 选，保证传旧 tag 仍能复现历史数据。
 FT_BUILD="auto"
 # prepare() 解析后的实际构建变体（write_configs 据此决定是否注入 AOT 专用 Serilog:Using）
 FT_BUILD_RESOLVED=""
+# dependent(-any) 包里没有无后缀 apphost，只有 *.dll，必须用 `dotnet xxx.dll` 启动。
+FT_DOTNET_LAUNCH="0"
 BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${BENCH_ROOT}/out/exp"
 
@@ -139,9 +141,23 @@ prepare() {
         esac
 
         local ft_dir="${OUT}/ft-release/${build}"
-        FT_SERVER_BIN="${ft_dir}/server/FastTunnel.Server"
-        FT_CLIENT_BIN="${ft_dir}/client/FastTunnel.Client"
-        if [[ ! -x "${FT_SERVER_BIN:-}" || ! -x "${FT_CLIENT_BIN:-}" ]]; then
+        # dependent(-any) 包无原生 apphost，只有 *.dll，需 dotnet 启动；aot/legacy 有无后缀可执行文件。
+        if [[ "${build}" == "dependent" ]]; then
+            FT_DOTNET_LAUNCH="1"
+            FT_SERVER_BIN="${ft_dir}/server/FastTunnel.Server.dll"
+            FT_CLIENT_BIN="${ft_dir}/client/FastTunnel.Client.dll"
+        else
+            FT_SERVER_BIN="${ft_dir}/server/FastTunnel.Server"
+            FT_CLIENT_BIN="${ft_dir}/client/FastTunnel.Client"
+        fi
+        # dll 没有执行位，用 -f 判存在；原生二进制用 -x。
+        local need_download=0
+        if [[ "${FT_DOTNET_LAUNCH}" == "1" ]]; then
+            [[ ! -f "${FT_SERVER_BIN:-}" || ! -f "${FT_CLIENT_BIN:-}" ]] && need_download=1
+        else
+            [[ ! -x "${FT_SERVER_BIN:-}" || ! -x "${FT_CLIENT_BIN:-}" ]] && need_download=1
+        fi
+        if [[ "${need_download}" == "1" ]]; then
             log "下载 FastTunnel ${FT_RELEASE}（${build}：${asset}）"
             local pkg="${OUT}/download/${asset}"
             mkdir -p "${OUT}/download" "${ft_dir}"
@@ -155,17 +171,19 @@ prepare() {
                     "${pkg}" "${ft_dir}"
             fi
             # 顶层目录名不固定，按文件名找二进制；-print -quit 避免 head 提前退出触发 pipefail。
-            # AOT 包是无后缀原生二进制，dependent/legacy 包同名 apphost + 同名 .dll，find 只取无后缀那个。
-            FT_SERVER_BIN="$(find "${ft_dir}" -type f -name 'FastTunnel.Server' -print -quit)"
-            FT_CLIENT_BIN="$(find "${ft_dir}" -type f -name 'FastTunnel.Client' -print -quit)"
+            # aot/legacy 取无后缀原生 apphost；dependent(-any) 无 apphost，只能取 .dll 用 dotnet 启动。
+            local srv_name="FastTunnel.Server" cli_name="FastTunnel.Client"
+            [[ "${FT_DOTNET_LAUNCH}" == "1" ]] && srv_name="FastTunnel.Server.dll" cli_name="FastTunnel.Client.dll"
+            FT_SERVER_BIN="$(find "${ft_dir}" -type f -name "${srv_name}" -print -quit)"
+            FT_CLIENT_BIN="$(find "${ft_dir}" -type f -name "${cli_name}" -print -quit)"
             if [[ -z "${FT_SERVER_BIN}" || -z "${FT_CLIENT_BIN}" ]]; then
                 fail "解压后没找到二进制，目录内容："
                 find "${ft_dir}" -maxdepth 3 | head -n 30 >&2
                 exit 1
             fi
         fi
-        chmod +x "${FT_SERVER_BIN}" "${FT_CLIENT_BIN}"
-        log "FastTunnel 二进制：${FT_SERVER_BIN} / ${FT_CLIENT_BIN}"
+        [[ "${FT_DOTNET_LAUNCH}" != "1" ]] && chmod +x "${FT_SERVER_BIN}" "${FT_CLIENT_BIN}"
+        log "FastTunnel 二进制：${FT_SERVER_BIN} / ${FT_CLIENT_BIN}${FT_DOTNET_LAUNCH:+（dotnet dll）}"
     else
         log "发布 FastTunnel（源码构建，net11.0 JIT）"
         FT_BUILD_RESOLVED="source"
@@ -350,11 +368,19 @@ start_ft() {
         ft_env=(env DOTNET_TC_CallCountingDelayMs=0 DOTNET_ThreadPool_SpuriousDispatchNoSpinThreshold=0)
         log "已为 ${FT_BUILD_RESOLVED:-source}(net11 JIT) 注入 .NET 11 性能开关：TC_CallCountingDelayMs=0 / ThreadPool_SpuriousDispatchNoSpinThreshold=0"
     fi
-    ( cd "${RUN_DIR}/ft-server" && exec "${ft_env[@]}" "${FT_SERVER_BIN}" >> "${RUN_DIR}/ft-server.log" 2>&1 ) &
+    # dependent(-any) 包只有 dll，需 dotnet 启动；dll 路径相对于各自工作目录。
+    local -a srv_launch=( "${FT_SERVER_BIN}" ) cli_launch=( "${FT_CLIENT_BIN}" )
+    if [[ "${FT_DOTNET_LAUNCH}" == "1" ]]; then
+        # 用 dll 绝对路径（工作目录仍 cd 到 RUN_DIR，保证 appsettings 从生成配置的目录读取）。
+        srv_launch=( dotnet "${FT_SERVER_BIN}" )
+        cli_launch=( dotnet "${FT_CLIENT_BIN}" )
+        log "dependent 包以 dotnet dll 方式启动：${FT_SERVER_BIN} / ${FT_CLIENT_BIN}"
+    fi
+    ( cd "${RUN_DIR}/ft-server" && exec "${ft_env[@]}" "${srv_launch[@]}" >> "${RUN_DIR}/ft-server.log" 2>&1 ) &
     FT_SERVER_PID=$!
     PIDS+=("${FT_SERVER_PID}")
     sleep 1
-    ( cd "${RUN_DIR}/ft-client" && exec "${ft_env[@]}" "${FT_CLIENT_BIN}" >> "${RUN_DIR}/ft-client.log" 2>&1 ) &
+    ( cd "${RUN_DIR}/ft-client" && exec "${ft_env[@]}" "${cli_launch[@]}" >> "${RUN_DIR}/ft-client.log" 2>&1 ) &
     FT_CLIENT_PID=$!
     PIDS+=("${FT_CLIENT_PID}")
 }
