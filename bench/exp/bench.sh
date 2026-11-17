@@ -34,6 +34,10 @@ FRP_POOL="0"
 FRAMEWORKS="ft,frp"
 FASTTUNNEL_ROOT="${FASTTUNNEL_ROOT:-}"
 FT_RELEASE=""
+# ft 构建变体：auto（按 tag 推断）/ aot（native AOT）/ dependent（依赖 .NET runtime）/ legacy（旧版 zip）。
+# 3.6.0+ 官方包拆分：FastTunnel-aot-linux-x64.tar.gz / FastTunnel-dependent-linux-x64.tar.gz；
+# 3.6.0 之前只有一个 FastTunnel-linux-x64.zip。auto 按 tag 选，保证传旧 tag 仍能复现历史数据。
+FT_BUILD="auto"
 BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${BENCH_ROOT}/out/exp"
 
@@ -70,6 +74,7 @@ while [[ $# -gt 0 ]]; do
         --log-level) LOG_LEVEL="$2"; shift 2 ;;
         --fasttunnel-root) FASTTUNNEL_ROOT="$2"; shift 2 ;;
         --ft-release) FT_RELEASE="$2"; shift 2 ;;
+        --ft-build) FT_BUILD="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
         *) echo "未知参数：$1" >&2; exit 2 ;;
@@ -107,30 +112,56 @@ prepare() {
     fi
 
     if [[ -n "${FT_RELEASE}" ]]; then
-        # 用官方 Release 包，保证测的就是用户下载到的那份
-        FT_SERVER_BIN="${OUT}/ft-release/FastTunnel-linux-x64/server/FastTunnel.Server"
-        FT_CLIENT_BIN="${OUT}/ft-release/FastTunnel-linux-x64/client/FastTunnel.Client"
-        if [[ ! -x "${FT_SERVER_BIN:-}" ]]; then
-            log "下载 FastTunnel ${FT_RELEASE}（GitHub Release）"
-            local zip="${OUT}/download/FastTunnel-linux-x64.zip"
-            mkdir -p "${OUT}/download" "${OUT}/ft-release"
-            curl -fsSL -o "${zip}" \
-                "https://github.com/FastTunnel/FastTunnel/releases/download/${FT_RELEASE}/FastTunnel-linux-x64.zip" || {
-                fail "下载失败：${FT_RELEASE}"; exit 1; }
-            # 用 python3 解压，避免 runner 上没有 unzip
-            python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
-                "${zip}" "${OUT}/ft-release"
-            # zip 顶层目录名不固定，直接按文件名找二进制；
-            # 只取无后缀的 apphost（*.dll/*.pdb 同名），用 -print -quit 避免 head 提前退出触发 pipefail
-            FT_SERVER_BIN="$(find "${OUT}/ft-release" -type f -name 'FastTunnel.Server' -print -quit)"
-            FT_CLIENT_BIN="$(find "${OUT}/ft-release" -type f -name 'FastTunnel.Client' -print -quit)"
+        # 用官方 Release 包，保证测的就是用户下载到的那份。
+        # 3.6.0 起官方包拆成 aot / dependent 两个 tar.gz；3.6.0 之前是单个 zip（legacy）。
+        local build="${FT_BUILD}" asset archive
+        if [[ "${build}" == "auto" ]]; then
+            # v3.6.x 及以上按 AOT 处理（这次的测试目标）；更老的 tag 回退到 legacy zip
+            local major minor
+            major=$(echo "${FT_RELEASE}" | sed -n 's/^v\([0-9]\+\).*/\1/p')
+            minor=$(echo "${FT_RELEASE}" | sed -n 's/^v[0-9]\+\.\([0-9]\+\).*/\1/p')
+            if [[ -n "${major}" && -n "${minor}" ]] && (( major > 3 || (major == 3 && minor >= 6) )); then
+                build="aot"
+            else
+                build="legacy"
+            fi
+            log "FT_BUILD=auto → ${build}（依据 ${FT_RELEASE}）"
+        fi
+        case "${build}" in
+            aot)       asset="FastTunnel-aot-linux-x64.tar.gz";       archive="tar" ;;
+            dependent) asset="FastTunnel-dependent-linux-x64.tar.gz"; archive="tar" ;;
+            legacy)    asset="FastTunnel-linux-x64.zip";              archive="zip" ;;
+            *) fail "未知 --ft-build：${build}（可选 aot/dependent/legacy/auto）"; exit 2 ;;
+        esac
+
+        local ft_dir="${OUT}/ft-release/${build}"
+        FT_SERVER_BIN="${ft_dir}/server/FastTunnel.Server"
+        FT_CLIENT_BIN="${ft_dir}/client/FastTunnel.Client"
+        if [[ ! -x "${FT_SERVER_BIN:-}" || ! -x "${FT_CLIENT_BIN:-}" ]]; then
+            log "下载 FastTunnel ${FT_RELEASE}（${build}：${asset}）"
+            local pkg="${OUT}/download/${asset}"
+            mkdir -p "${OUT}/download" "${ft_dir}"
+            curl -fsSL -o "${pkg}" \
+                "https://github.com/FastTunnel/FastTunnel/releases/download/${FT_RELEASE}/${asset}" || {
+                fail "下载失败：${FT_RELEASE}/${asset}（该 tag 可能没有这个构建变体）"; exit 1; }
+            if [[ "${archive}" == "tar" ]]; then
+                tar -xzf "${pkg}" -C "${ft_dir}"
+            else
+                python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
+                    "${pkg}" "${ft_dir}"
+            fi
+            # 顶层目录名不固定，按文件名找二进制；-print -quit 避免 head 提前退出触发 pipefail。
+            # AOT 包是无后缀原生二进制，dependent/legacy 包同名 apphost + 同名 .dll，find 只取无后缀那个。
+            FT_SERVER_BIN="$(find "${ft_dir}" -type f -name 'FastTunnel.Server' -print -quit)"
+            FT_CLIENT_BIN="$(find "${ft_dir}" -type f -name 'FastTunnel.Client' -print -quit)"
             if [[ -z "${FT_SERVER_BIN}" || -z "${FT_CLIENT_BIN}" ]]; then
                 fail "解压后没找到二进制，目录内容："
-                find "${OUT}/ft-release" -maxdepth 3 | head -n 30 >&2
+                find "${ft_dir}" -maxdepth 3 | head -n 30 >&2
                 exit 1
             fi
         fi
         chmod +x "${FT_SERVER_BIN}" "${FT_CLIENT_BIN}"
+        log "FastTunnel 二进制：${FT_SERVER_BIN} / ${FT_CLIENT_BIN}"
     else
         log "发布 FastTunnel（源码构建）"
         FT_SERVER_BIN="${OUT}/ft-server/FastTunnel.Server"

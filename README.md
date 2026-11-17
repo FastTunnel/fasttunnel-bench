@@ -58,7 +58,9 @@ raw samples: [`results/`](results/) · chart: [`docs/tweet-chart.png`](docs/twee
 ## CI / 自动压测（GitHub Actions）
 
 `.github/workflows/bench.yml`：**手动触发**（Actions → `bench` → Run workflow）+ **每周日 03:00 UTC 定时触发**，
-可配 `levels`（HTTP/TCP 的 RPS 阶梯）/ `udp_levels`（UDP 的 PPS 阶梯，默认 `1000,3000,5000,10000,20000,30000,40000,50000`，与 RPS 独立避免高档位压不满）/ 并发 /
+可配 `ft_release`（FastTunnel 版本，默认 `v3.6.1`）/ `ft_build`（构建变体，默认 `aot` = native AOT；
+`dependent` = 依赖 .NET runtime 的 JIT 版；`legacy` = v3.6 之前的单 zip 包；`auto` = 按 tag 推断）/
+`levels`（HTTP/TCP 的 RPS 阶梯）/ `udp_levels`（UDP 的 PPS 阶梯，默认 `1000,3000,5000,10000,20000,30000,40000,50000`，与 RPS 独立避免高档位压不满）/ 并发 /
 `auto_connections`（并发随档位放大，默认 `1`）/ `rounds`（默认 `3`，奇偶轮交换两侧先后）/ `frp_pool`
 （frp 双侧连接池，默认 `0` = 出厂默认）/ `mode`（`all`=三种都跑，**默认** / `http` / `tcp` / `udp` / `both`=仅 http+tcp）。
 默认与定时触发都跑全部三种模式（含 UDP）。跑完自动把结果发成**一条新 issue**（标签 `bench-report`，按时间线可对比），原始数据作为 artifact 上传。
@@ -77,8 +79,11 @@ raw samples: [`results/`](results/) · chart: [`docs/tweet-chart.png`](docs/twee
 ## 被测版本 / What is measured
 
 本文的本机快照数字来自 **v3 分支的优化版本**（mux 重写、管道泵等）源码构建；
-CI 默认下载**官方 Release 包**测试（`--ft-release v3.4.0`），保证测的就是用户下载到的那份，
-需要复算本文数字时用 `--fasttunnel-root <FastTunnel 源码目录>` 切回源码构建。frp 为 0.72.0 官方二进制。
+CI 默认下载**官方 Release 包**测试（`--ft-release v3.6.1 --ft-build aot`，即 native AOT 版），
+保证测的就是用户下载到的那份。v3.6.0 起官方把包拆成 aot（自包含原生二进制，约 42 MB）与
+dependent（依赖 .NET runtime 的 JIT 版，约 1.8 MB）两种，3.6.0 之前只有单个 zip（用 `--ft-build legacy`
+复现历史 v3.4.0 数据）。需要复算本文数字时用 `--fasttunnel-root <FastTunnel 源码目录>` 切回源码构建。
+frp 为 0.72.0 官方二进制。
 
 ## 最新结果 / Latest results
 
