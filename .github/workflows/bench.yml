@@ -242,6 +242,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
           MODE_INPUT: ${{ github.event.inputs.mode || 'all' }}
           LEVELS_INPUT: ${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}
           FT_RELEASE_INPUT: ${{ github.event.inputs.ft_release || 'v3.6.1' }}
@@ -252,6 +253,18 @@ jobs:
           url=$(gh issue create --title "$title" --body-file issue-body.md --label bench-report)
           echo "已创建：$url"
           echo "$url" >> "$GITHUB_STEP_SUMMARY"
+
+          # 失败轮次仍创建 issue（排障信息在正文里），但立刻关闭并打标：
+          # 打开的 issue 列表只留成功的轮次，按时间线对比时不被失败噪音干扰。
+          # 判定同时看 job 状态和是否产出报告，兼容「部分步骤失败但仍出了报告」的情况。
+          report_count=$(ls out/exp/report-http.md out/exp/report-tcp.md out/exp/report-udp.md 2>/dev/null | wc -l)
+          if [ "$JOB_STATUS" != "success" ] || [ "$report_count" -eq 0 ]; then
+            num=${url##*/}
+            gh label create bench-failed --color B60205 --description '自动压测失败（已自动关闭）' 2>/dev/null || true
+            gh issue edit "$num" --add-label bench-failed --title "[失败] $title" >/dev/null
+            gh issue close "$num" --comment "本轮压测未成功（job=${JOB_STATUS}，产出报告数=${report_count}），自动关闭；排障信息见正文。" >/dev/null
+            echo "本轮失败（job=${JOB_STATUS}，报告数=${report_count}），issue #${num} 已自动关闭"
+          fi
 
       - name: 上传原始数据与日志
         if: always()
