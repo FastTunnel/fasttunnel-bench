@@ -69,7 +69,11 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          # 10.0.x：LoadRunner 压测器（net10.0）；11.0.x：ft dependent 包与源码构建的运行时（net11.0）。
+          # AOT 原生二进制与 frp(Go) 不依赖 runtime，但 dependent 变体缺 11.0 会直接起不来。
+          dotnet-version: |
+            10.0.x
+            11.0.x
 
       - name: 安装绘图依赖与中文字体
         run: |
