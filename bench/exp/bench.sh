@@ -131,8 +131,9 @@ prepare() {
         fi
         FT_BUILD_RESOLVED="${build}"
         case "${build}" in
-            aot)       asset="FastTunnel-aot-linux-x64.tar.gz";       archive="tar" ;;
-            dependent) asset="FastTunnel-dependent-linux-x64.tar.gz"; archive="tar" ;;
+            aot)       asset="FastTunnel-aot-linux-x64.tar.gz";  archive="tar" ;;
+            # v3.6.1 的 dependent 包是跨架构通用包，实际资产名就是 -any（1.8MB，依赖目标机 .NET runtime）。
+            dependent) asset="FastTunnel-dependent-any.tar.gz";   archive="tar" ;;
             legacy)    asset="FastTunnel-linux-x64.zip";              archive="zip" ;;
             *) fail "未知 --ft-build：${build}（可选 aot/dependent/legacy/auto）"; exit 2 ;;
         esac
