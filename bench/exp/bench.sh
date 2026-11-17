@@ -166,7 +166,8 @@ prepare() {
         chmod +x "${FT_SERVER_BIN}" "${FT_CLIENT_BIN}"
         log "FastTunnel 二进制：${FT_SERVER_BIN} / ${FT_CLIENT_BIN}"
     else
-        log "发布 FastTunnel（源码构建）"
+        log "发布 FastTunnel（源码构建，net11.0 JIT）"
+        FT_BUILD_RESOLVED="source"
         FT_SERVER_BIN="${OUT}/ft-server/FastTunnel.Server"
         FT_CLIENT_BIN="${OUT}/ft-client/FastTunnel.Client"
         if ! dotnet publish "${FASTTUNNEL_ROOT}/FastTunnel.Server/FastTunnel.Server.csproj" \
@@ -336,11 +337,23 @@ start_origin() {
 }
 
 start_ft() {
-    ( cd "${RUN_DIR}/ft-server" && exec "${FT_SERVER_BIN}" >> "${RUN_DIR}/ft-server.log" 2>&1 ) &
+    # 非 AOT 的 dependent 包是 net11.0，跑在 .NET 11 runtime 上。.NET 11 在这类高吞吐
+    # socket 负载上有两个已知退化：分层编译 call-counting 预热延迟、线程池自旋阈值回归。
+    # 必须注入下面两个环境变量才能恢复正常水平（实测组合可让吞吐 +15%、CPU -19%）。
+    # 结论与数据见 FastTunnel 主仓库 bench/out/ab/REPORT.md 附录三。
+    # - AOT 是原生二进制，不读 DOTNET_*，无需注入；
+    # - legacy(v3.4.0, net8) 不受该退化影响，也不注入。
+    # 用排除法：其余（dependent 包 + 源码 publish，均 net11.0 JIT）都要注入。
+    local -a ft_env=()
+    if [[ "${FT_BUILD_RESOLVED}" != "aot" && "${FT_BUILD_RESOLVED}" != "legacy" ]]; then
+        ft_env=(env DOTNET_TC_CallCountingDelayMs=0 DOTNET_ThreadPool_SpuriousDispatchNoSpinThreshold=0)
+        log "已为 ${FT_BUILD_RESOLVED:-source}(net11 JIT) 注入 .NET 11 性能开关：TC_CallCountingDelayMs=0 / ThreadPool_SpuriousDispatchNoSpinThreshold=0"
+    fi
+    ( cd "${RUN_DIR}/ft-server" && exec "${ft_env[@]}" "${FT_SERVER_BIN}" >> "${RUN_DIR}/ft-server.log" 2>&1 ) &
     FT_SERVER_PID=$!
     PIDS+=("${FT_SERVER_PID}")
     sleep 1
-    ( cd "${RUN_DIR}/ft-client" && exec "${FT_CLIENT_BIN}" >> "${RUN_DIR}/ft-client.log" 2>&1 ) &
+    ( cd "${RUN_DIR}/ft-client" && exec "${ft_env[@]}" "${FT_CLIENT_BIN}" >> "${RUN_DIR}/ft-client.log" 2>&1 ) &
     FT_CLIENT_PID=$!
     PIDS+=("${FT_CLIENT_PID}")
 }
