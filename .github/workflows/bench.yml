@@ -164,7 +164,11 @@ jobs:
             git config user.email "bench-bot@users.noreply.github.com"
             git add results/latest results/runs
             git commit -q -m "chore(bench): charts for run #${RUN_NUM}"
-            git push origin HEAD:${{ github.ref_name }}
+            # 图表只是展示，数据 CSV 已在 issue 正文和 artifact 里。并发 run 或外部
+            # 推送可能让 push 撞上 non-fast-forward；此时不能让整个 job 标失败，
+            # 否则「三模式都成功、只是出图失败」的轮次会被自动关闭逻辑误伤。
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            git push origin HEAD:${{ github.ref_name }} || echo "图表推送失败（并发冲突），数据不受影响"
           else
             echo "没有可提交的图表"
           fi
@@ -256,14 +260,16 @@ jobs:
 
           # 失败轮次仍创建 issue（排障信息在正文里），但立刻关闭并打标：
           # 打开的 issue 列表只留成功的轮次，按时间线对比时不被失败噪音干扰。
-          # 判定同时看 job 状态和是否产出报告，兼容「部分步骤失败但仍出了报告」的情况。
+          # 判定只看「一个模式报告都没产出」这个硬标准——不能用 job.status：
+          # 图表提交/上传等辅助步骤带 always()，它们失败会把 job 标成 failure，
+          # 但三模式的实测数据其实完好（run #57 就栽在这），那种轮次不该被误关。
           report_count=$(ls out/exp/report-http.md out/exp/report-tcp.md out/exp/report-udp.md 2>/dev/null | wc -l)
-          if [ "$JOB_STATUS" != "success" ] || [ "$report_count" -eq 0 ]; then
+          if [ "$report_count" -eq 0 ]; then
             num=${url##*/}
             gh label create bench-failed --color B60205 --description '自动压测失败（已自动关闭）' 2>/dev/null || true
             gh issue edit "$num" --add-label bench-failed --title "[失败] $title" >/dev/null
-            gh issue close "$num" --comment "本轮压测未成功（job=${JOB_STATUS}，产出报告数=${report_count}），自动关闭；排障信息见正文。" >/dev/null
-            echo "本轮失败（job=${JOB_STATUS}，报告数=${report_count}），issue #${num} 已自动关闭"
+            gh issue close "$num" --comment "本轮未产出任何模式报告（job=${JOB_STATUS}），判定为失败，自动关闭；排障信息见正文。" >/dev/null
+            echo "本轮无报告产出（job=${JOB_STATUS}），issue #${num} 已自动关闭"
           fi
 
       - name: 上传原始数据与日志
