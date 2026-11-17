@@ -65,6 +65,11 @@ raw samples: [`results/`](results/) · chart: [`docs/tweet-chart.png`](docs/twee
 （frp 双侧连接池，默认 `0` = 出厂默认）/ `mode`（`all`=三种都跑，**默认** / `http` / `tcp` / `udp` / `both`=仅 http+tcp）。
 默认与定时触发都跑全部三种模式（含 UDP）。跑完自动把结果发成**一条新 issue**（标签 `bench-report`，按时间线可对比），原始数据作为 artifact 上传。
 
+> **图表归档**：每轮出图写两处——`results/latest/chart-*.png` 永远指向最新一轮（给 README 配图用），
+> `results/runs/<run号>/chart-*.png` 是本轮**不可变快照**，issue 正文引用后者。
+> 因此回看历史 issue 时图与当轮数据始终对得上；早期 issue（run #48 及之前）用的是 `latest + ?v=` 旧链接，
+> 服务器忽略 `?v=`，会显示最新那张图——**这些旧 issue 请以正文内嵌的 CSV 为准，别看它的图**。
+
 > UDP 对照：两侧同一层（FastTunnel `Forwards[].Protocol=UDP` vs frp `type=udp`），共享同一个内置 UDP echo 源站，
 > 用带 `magic+seq+sendTicks` 的数据报测逐包 RTT 与丢包；吞吐列是**成功 PPS**（只数内容匹配的有效 echo），
 > 错误率≈丢包率。就绪探测走 `udpping`（curl 探不到 UDP）。三种模式端口互相错开，可单独跑也可 `all` 一起跑。

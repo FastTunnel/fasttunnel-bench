@@ -131,10 +131,11 @@ jobs:
         env:
           LEVELS_INPUT: ${{ github.event.inputs.levels || '5000,10000,20000,30000,40000,50000' }}
           UDP_LEVELS_INPUT: ${{ github.event.inputs.udp_levels || '1000,3000,5000,10000,20000,30000,40000,50000' }}
+          RUN_NUM: ${{ github.run_number }}
         run: |
-          mkdir -p results/latest
+          mkdir -p results/latest "results/runs/${RUN_NUM}"
           shopt -s nullglob
-          # 每次运行都是全新 checkout，out/exp 里只会有多跑过的模式留下的 CSV；
+          # 每次运行都是全新 checkout，out/exp 里只会有本次跑过的模式留下的 CSV；
           # 这里统一遍历三种，-f 守卫跳过没跑的模式。
           for mode in http tcp udp; do
             csv="out/exp/results-${mode}.csv"
@@ -142,13 +143,17 @@ jobs:
               if [ "$mode" = "udp" ]; then levels="$UDP_LEVELS_INPUT"; else levels="$LEVELS_INPUT"; fi
               python3 bench/exp/chart.py --csv "$csv" --out "results/latest/chart-${mode}.png" --mode "$mode" --levels "$levels"
               cp "$csv" "results/latest/results-${mode}.csv"
+              # results/latest 永远指向最新一轮（README 配图用）；results/runs/<N> 是
+              # 本轮不可变快照，历史 issue 引用它，回看时不会被后续 run 覆盖。
+              cp "results/latest/chart-${mode}.png" "results/runs/${RUN_NUM}/chart-${mode}.png"
+              cp "$csv" "results/runs/${RUN_NUM}/results-${mode}.csv"
             fi
           done
-          if [ -n "$(git status --porcelain results/latest)" ]; then
+          if [ -n "$(git status --porcelain results/latest results/runs)" ]; then
             git config user.name "bench-bot"
             git config user.email "bench-bot@users.noreply.github.com"
-            git add results/latest
-            git commit -q -m "chore(bench): charts for run #${{ github.run_number }}"
+            git add results/latest results/runs
+            git commit -q -m "chore(bench): charts for run #${RUN_NUM}"
             git push origin HEAD:${{ github.ref_name }}
           else
             echo "没有可提交的图表"
@@ -156,6 +161,8 @@ jobs:
 
       - name: 生成 Issue 正文
         if: always()
+        env:
+          RUN_NUM: ${{ github.run_number }}
         run: |
           raw="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME"
           {
@@ -169,13 +176,18 @@ jobs:
             echo "> frp 连接池：\`0\`=出厂默认（frpc poolCount=1 / frps maxPoolCount=5，本轮默认）；\`auto\`/数字=双侧一起调平，实测会让 frp 的 http 模式更差，只在显式要求时启用。"
             echo
             for mode in http tcp udp; do
-              chart="results/latest/chart-${mode}.png"
+              # 引用本轮快照，不用 results/latest + ?v= —— 那个查询参数服务器会忽略，
+              # 历史 issue 会全部显示 main 上当前那张图（run #48/#50 踩过这个坑）。
+              chart="results/runs/${RUN_NUM}/chart-${mode}.png"
               report="out/exp/report-${mode}.md"
               [ -f "$report" ] || continue
               echo "## ${mode} 模式"
               echo
               if [ -f "$chart" ]; then
-                echo "![${mode}](${raw}/${chart}?v=${{ github.run_number }})"
+                echo "![${mode}](${raw}/${chart})"
+                echo
+              else
+                echo "> ⚠ 本轮 ${mode} 图表未生成（出图步骤失败或未跑该模式），数据表仍可见。"
                 echo
               fi
               echo "<details><summary>展开明细（数据表 / 原始 CSV）</summary>"
