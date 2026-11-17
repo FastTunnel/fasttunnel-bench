@@ -38,6 +38,8 @@ FT_RELEASE=""
 # 3.6.0+ 官方包拆分：FastTunnel-aot-linux-x64.tar.gz / FastTunnel-dependent-linux-x64.tar.gz；
 # 3.6.0 之前只有一个 FastTunnel-linux-x64.zip。auto 按 tag 选，保证传旧 tag 仍能复现历史数据。
 FT_BUILD="auto"
+# prepare() 解析后的实际构建变体（write_configs 据此决定是否注入 AOT 专用 Serilog:Using）
+FT_BUILD_RESOLVED=""
 BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${BENCH_ROOT}/out/exp"
 
@@ -127,6 +129,7 @@ prepare() {
             fi
             log "FT_BUILD=auto → ${build}（依据 ${FT_RELEASE}）"
         fi
+        FT_BUILD_RESOLVED="${build}"
         case "${build}" in
             aot)       asset="FastTunnel-aot-linux-x64.tar.gz";       archive="tar" ;;
             dependent) asset="FastTunnel-dependent-linux-x64.tar.gz"; archive="tar" ;;
@@ -192,6 +195,12 @@ prepare() {
 write_configs() {
     mkdir -p "${RUN_DIR}/ft-server/config" "${RUN_DIR}/ft-client" "${RUN_DIR}/frp"
 
+    # 单文件 AOT 下 Serilog 无法反射发现 sink 程序集，配置必须显式带 Serilog:Using，
+    # 且只能列 Console —— AOT 只静态链接了 Console sink，列 File 会 FileNotFoundException。
+    # dependent/legacy（IL 发布版）不需要也不应有这个节，故按 prepare() 解析出的实际变体注入。
+    local serilog_using=""
+    [[ "${FT_BUILD_RESOLVED}" == "aot" ]] && serilog_using='"Using": [ "Serilog.Sinks.Console" ], '
+
     local enable_forward="false"
     local webs="[]"
     local forwards="[]"
@@ -220,7 +229,7 @@ write_configs() {
 
     cat > "${RUN_DIR}/ft-server/config/appsettings.json" <<JSON
 {
-  "Serilog": { "MinimumLevel": { "Default": "${LOG_LEVEL}", "Override": { "Microsoft": "Warning" } }, "WriteTo": [] },
+  "Serilog": { ${serilog_using}"MinimumLevel": { "Default": "${LOG_LEVEL}", "Override": { "Microsoft": "Warning" } }, "WriteTo": [] },
   "FastTunnel": {
     "BinPort": ${FT_BIN_PORT},
     "WebDomain": "${FT_DOMAIN}",
@@ -240,7 +249,7 @@ JSON
 
     cat > "${RUN_DIR}/ft-client/appsettings.json" <<JSON
 {
-  "Serilog": { "MinimumLevel": { "Default": "${LOG_LEVEL}", "Override": { "Microsoft": "Warning" } }, "WriteTo": [] },
+  "Serilog": { ${serilog_using}"MinimumLevel": { "Default": "${LOG_LEVEL}", "Override": { "Microsoft": "Warning" } }, "WriteTo": [] },
   "FastTunnel": {
     "Server": {
       "ServerAddr": "127.0.0.1",
